@@ -1,58 +1,64 @@
 -- @ScriptType: ModuleScript
--- ============================================================
---  Storm.lua  |  ModuleScript
---  Location: ServerStorage/CombatStyles/Sword/Storm
---
---  Sword Style 3: Raging Storm — slow, heavy blows with
---  devastating knockback and high stun. High risk, high reward.
---
---  STATUS: STUB — tune values once animations are finalised.
---  windupWait values below are PLACEHOLDERS.
---
---  Animation folder: CombatClient > "Sword Animations Storm"
---  (create this folder in CombatClient when animations are ready)
--- ============================================================
-
+-- @ScriptType: ModuleScript
+-- Location: ServerStorage/CombatStyles/Sword/Default
 return {
-	styleName  = "Storm",
+	styleName  = "Default",
 	weaponType = "Sword",
+
+	sounds = {
+		hitId = "rbxassetid://0",
+	},
 
 	attacks = {
 
 		Regular = {
-			damage       = 24,
-			selfImpulse  = 12,
-			knockback    = 40,
-			knockUpRatio = 0.12,
-			stunTime     = 1.00,
-			hitboxSize   = Vector3.new(6, 6, 8),    -- wider arc
+			damage       = 17,
+			knockback    = 30,
+			knockUpRatio = 0.10,
+			stunTime     = 0.90,
+			hitboxSize   = Vector3.new(4, 5, 7),
 			hitboxFwd    = -5.0,
-			windupWait   = 1.00,    -- PLACEHOLDER
+			hitWindow    = 0.15,
+			windupWait   = 0.90,
 			breaksBlock  = false,
+			selfImpulse  = 12,
+			velocity     = { forward = 18, up = 0, duration = 0.20 },
+			serverCD     = 1.05,
 		},
 
 		Last = {
-			damage       = 34,
-			selfImpulse  = 16,
-			knockback    = 70,
-			knockUpRatio = 0.32,
-			stunTime     = 1.40,
-			hitboxSize   = Vector3.new(7, 6, 8),
-			hitboxFwd    = -5.5,
-			windupWait   = 1.30,    -- PLACEHOLDER
-			breaksBlock  = false,
+			damage            = 26,
+			knockback         = 60,
+			knockUpRatio      = 0.28,
+			stunTime          = 1.20,
+			hitboxSize        = Vector3.new(5, 5, 8),
+			hitboxFwd         = -5.5,
+			hitWindow         = 0.20,
+			windupWait        = 1.20,
+			breaksBlock       = false,
+			selfImpulse       = 18,
+			ragdoll           = true,
+			ragdollDuration   = 2.5,
+			canSoftKnockdown  = true,
+			knockdownDuration = 2.5,
+			velocity          = { forward = 22, up = 2, duration = 0.30 },
+			serverCD          = 2.70,
 		},
 
 		Heavy = {
-			damage       = 50,
-			selfImpulse  = 20,
-			knockback    = 95,
-			knockUpRatio = 0.15,
-			stunTime     = 2.10,
-			hitboxSize   = Vector3.new(6, 6, 11),
+			damage       = 40,
+			knockback    = 80,
+			knockUpRatio = 0.12,
+			stunTime     = 1.90,
+			hitboxSize   = Vector3.new(3.5, 5, 10),
 			hitboxFwd    = -6.0,
-			windupWait   = 1.80,    -- PLACEHOLDER
+			hitWindow    = 0.20,
+			windupWait   = 1.67,
 			breaksBlock  = true,
+			selfImpulse  = 24,
+			velocity     = { forward = 26, up = 0, duration = 0.35 },
+			serverCD     = 2.20,
+			endlag       = 0.60,
 		},
 	},
 }
