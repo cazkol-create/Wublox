@@ -1,31 +1,32 @@
 -- @ScriptType: Script
+-- @ScriptType: Script
 -- ============================================================
 --  CombatServer.lua  |  Script  (NOT ModuleScript)
 --  Location: ServerScriptService
 --
---  Authoritative server for all combat. Clients fire actions,
---  server validates, resolves block/parry, applies damage.
+--  PIPELINE: Client input → Server logic → Client output (visuals)
 --
---  ── Children this Script needs ──────────────────────────────
---    Hit           Animation   hit-react played on any struck target
---    "Punch Hit"   Sound       impact thud
---    "Parry Clash" Sound       metallic ring on a successful parry
+--  CHANGES:
+--    CombatFX (UnreliableRemoteEvent) — ALL cosmetic events
+--      (attack animations, hit effects, sounds, VFX) are fired
+--      through this unreliable channel.  These are visual flare
+--      only; the game remains correct even if a packet drops.
 --
---  ── ReplicatedStorage ───────────────────────────────────────
---    Modules/CombatData    ModuleScript
---    Combat                RemoteEvent   (client → server)
---    CombatFeedback        RemoteEvent   (server → client)
---    GameSettings          RemoteEvent   (client → server, settings)
---    "Punch-01"/Main/Hit1  VFX folder
+--    CombatFeedback (RemoteEvent, reliable) — gameplay-critical
+--      events only: ParrySuccess, GuardBroken, ParryWhiff,
+--      SkillCooldown, SkillEquipResult.
 --
---  ── ServerStorage ───────────────────────────────────────────
---    CombatStyles/Sword/Default   ModuleScript
---    CombatStyles/Sword/Flowing   ModuleScript
---    CombatStyles/Sword/Storm     ModuleScript
+--    MuchachoHitbox fix — hb:Stop() only; MuchachoHitbox has
+--      AutoDestroy = true by default so the hitbox cleans itself
+--      up on Stop.  Calling Destroy() after Stop was causing the
+--      "attempt to destroy already-destroyed object" error.
 --
---  ── ServerScriptService/Modules ─────────────────────────────
---    CombatState   ModuleScript
---    RagdollUtil   ModuleScript
+--    Server-side combo — CombatState.GetCombo() / IncrementCombo()
+--      own the combo counter.  Client sends action="M1" with no
+--      index; server picks the correct comboHit def and tells the
+--      client which animation to play via CombatFX.
+--
+--    NormalDash action — handled here; delegates to MovementUtil.
 -- ============================================================
 
 local Players    = game:GetService("Players")
@@ -33,426 +34,501 @@ local SS         = game:GetService("ServerStorage")
 local Debris     = game:GetService("Debris")
 local RS         = game:GetService("ReplicatedStorage")
 
--- ── Module imports ───────────────────────────────────────────
--- CombatData is in ReplicatedStorage so the client can also read it.
-local CombatData  = require(RS.Modules.CombatData)
-local CombatState = require(script.Parent.Modules.CombatState)
-local RagdollUtil = require(script.Parent.Modules.RagdollUtil)
+local CombatData      = require(RS.Modules.CombatData)
+local CombatState     = require(script.Parent.Modules.CombatState)
+local RagdollUtil     = require(script.Parent.Modules.RagdollUtil)
+local StatusEffectUtil= require(script.Parent.Modules.StatusEffectUtil)
+local KnockdownUtil   = require(script.Parent.Modules.KnockdownUtil)
+local MovementUtil    = require(script.Parent.Modules.MovementUtil)
+local SkillSystem     = require(script.Parent.Modules.SkillSystem)
+local MuchachoHitbox  = require(script.Parent.Modules.MuchachoHitbox)
+local SoundUtil       = require(RS.Modules.SoundUtil)
+local InventoryData   = require(RS.Modules.InventoryData)
 
--- ── Remotes ──────────────────────────────────────────────────
-local Combat         = RS:WaitForChild("Combat")
-local CombatFB       = RS:WaitForChild("CombatFeedback")
-local GameSettingsRE = RS:WaitForChild("GameSettings", 5)
+-- ── Remote helpers ────────────────────────────────────────────
+local function getOrCreate(parent, name, class)
+	local e = parent:FindFirstChild(name)
+	if e then return e end
+	local obj = Instance.new(class); obj.Name = name; obj.Parent = parent; return obj
+end
+
+-- Reliable: gameplay-critical events
+local Combat            = RS:WaitForChild("Combat")
+local CombatFeedback    = RS:WaitForChild("CombatFeedback")    -- ReliableRemoteEvent
+local GameSettingsRE    = RS:WaitForChild("GameSettings", 5)
+local ChangeStyle       = RS:WaitForChild("ChangeStyle", 15)
+local UseSkill          = getOrCreate(RS, "UseSkill",          "RemoteEvent")
+local EquipSkillRE      = getOrCreate(RS, "EquipSkill",        "RemoteEvent")
+local UnequipSkillRE    = getOrCreate(RS, "UnequipSkill",      "RemoteEvent")
+local CharacterFeedback = getOrCreate(RS, "CharacterFeedback", "RemoteEvent")
+
+-- Unreliable: all cosmetic output (animations, VFX, sounds)
+-- UnreliableRemoteEvent — packets may drop; that is acceptable for visual flare.
+local CombatFX = getOrCreate(RS, "CombatFX", "UnreliableRemoteEvent")
+
+-- ============================================================
+-- DEVELOPER CONFIG
+-- ============================================================
+local CONFIG = {
+	NORMAL_SPEED    = 16,
+	ATTACK_SPEED    = 7,
+	PARRY_STUN_TIME = 1.80,
+	BLOCK_REDUCTION = 0.70,
+	RATE_LIGHT      = 0.45,   -- fallback when def.serverCD absent
+	RATE_HEAVY      = 2.00,
+	RATE_FLOURISH   = 2.20,
+	DEFAULT_HIT_WINDOW      = 0.15,
+	VELOCITY_PREDICTION     = true,
+	VELOCITY_PREDICTION_TIME= 0.15,
+}
+
+local debugPlayers = {}
 
 -- ============================================================
 -- STYLE LOADER
--- Reads Plr_WeaponType and Plr_StyleName StringValues from the
--- player object and returns the matching ModuleScript data table.
--- Hierarchy: ServerStorage/CombatStyles/[WeaponType]/[StyleName]
--- Falls back to Default if StyleName is missing or fails to load.
 -- ============================================================
 local styleCache   = {}
 local stylesFolder = SS:WaitForChild("CombatStyles", 10)
 
-local function loadStyleModule(weaponType, styleName)
-	local cacheKey = weaponType .. "/" .. styleName
-	if styleCache[cacheKey] then return styleCache[cacheKey] end
-
-	local weaponFolder = stylesFolder and stylesFolder:FindFirstChild(weaponType)
-	local mod          = weaponFolder  and (
-		weaponFolder:FindFirstChild(styleName) or
-			weaponFolder:FindFirstChild("Default")
-	)
-
-	if not mod then
-		warn("[CombatServer] Style not found:", cacheKey, "— check ServerStorage/CombatStyles/")
-		return nil
-	end
-
+local function loadStyleModule(wt, sn)
+	local key = wt .. "/" .. sn
+	if styleCache[key] then return styleCache[key] end
+	local wf  = stylesFolder and stylesFolder:FindFirstChild(wt)
+	local mod = wf and (wf:FindFirstChild(sn) or wf:FindFirstChild("Default"))
+	if not mod then warn("[CombatServer] Style not found:", key); return nil end
 	local ok, result = pcall(require, mod)
-	if not ok then
-		warn("[CombatServer] Failed to load style:", cacheKey, "\n", result)
-		return nil
-	end
-
-	styleCache[cacheKey] = result
-	return result
+	if not ok then warn("[CombatServer] Failed:", key, result); return nil end
+	styleCache[key] = result; return result
 end
 
 local function getPlayerStyle(player)
-	local wt  = player:FindFirstChild("Plr_WeaponType")
-	local sn  = player:FindFirstChild("Plr_StyleName")
-	local weaponType = (wt and wt.Value ~= "") and wt.Value or "Sword"
-	local styleName  = (sn and sn.Value ~= "") and sn.Value or "Default"
-	return loadStyleModule(weaponType, styleName)
+	local wt = player:FindFirstChild("Plr_WeaponType")
+	local sn = player:FindFirstChild("Plr_StyleName")
+	return loadStyleModule(
+		(wt and wt.Value ~= "") and wt.Value or "Fist",
+		(sn and sn.Value ~= "") and sn.Value or "Default"
+	)
 end
 
--- Create Plr_WeaponType and Plr_StyleName for every player on join
--- if they don't already exist (set by another script).
 Players.PlayerAdded:Connect(function(player)
-	if not player:FindFirstChild("Plr_WeaponType") then
-		local v = Instance.new("StringValue")
-		v.Name = "Plr_WeaponType"; v.Value = "Default"; v.Parent = player
+	local function sv(name, val)
+		if not player:FindFirstChild(name) then
+			local v=Instance.new("StringValue"); v.Name=name; v.Value=val; v.Parent=player
+		end
 	end
-	if not player:FindFirstChild("Plr_StyleName") then
-		local v = Instance.new("StringValue")
-		v.Name = "Plr_StyleName"; v.Value = "Default"; v.Parent = player
-	end
+	sv("Plr_WeaponType", ""); sv("Plr_StyleName", "")
+	SkillSystem.InitPlayer(player)
 end)
 
 -- ============================================================
--- GLOBAL TUNING CONSTANTS
+-- UTILITY
 -- ============================================================
-local NORMAL_SPEED    = 16
-local ATTACK_SPEED    = 7
-local PARRY_STUN_TIME = 1.80    -- attacker frozen when parried
-local BLOCK_REDUCTION = 0.70    -- fraction of damage absorbed by block
-local RATE_LIGHT      = 0.45    -- server minimum seconds between light attacks
-local RATE_HEAVY      = 2.00    -- server minimum seconds between heavy attacks
+local function getEquippedTool(char)
+	if not char then return nil end
+	for _, obj in ipairs(char:GetChildren()) do
+		if obj:IsA("Tool") then return obj end
+	end
+end
 
--- ============================================================
--- PER-PLAYER DEBUG FLAGS
--- Toggled by the client via GameSettings remote.
--- When true: the server fires CombatFeedback "DebugHitbox" to
--- ONLY that player's client, which then creates a local Part
--- only they can see. The server NEVER creates the Part itself.
--- This is why the old code showed hitboxes for everyone — it was
--- creating a workspace Part replicated to all clients.
--- ============================================================
-local debugPlayers = {}   -- [userId] = true/false
-
--- ============================================================
--- UTILITY FUNCTIONS
--- ============================================================
-
-local function getAnimator(character)
-	local hum = character:FindFirstChildOfClass("Humanoid")
+local function getAnimator(char)
+	local hum = char:FindFirstChildOfClass("Humanoid")
 	return hum and hum:FindFirstChildOfClass("Animator")
 end
 
--- Applies (or refreshes) a "Stunned" BoolValue.
--- Also clears the character's block state so the server never
--- thinks a stunned character is still blocking.
-local function applyStun(character, duration)
-	if not character then return end
-
-	-- Always clear block state when stunned — this is the core
-	-- fix for "subsequent attacks bypass guard after heavy."
-	-- A stunned character cannot be blocking on the server anymore.
-	CombatState.ClearBlockOnStun(character)
-
-	local existing = character:FindFirstChild("Stunned")
-	if existing then
-		Debris:AddItem(existing, duration)   -- refresh timer
-		return
-	end
-	local bool  = Instance.new("BoolValue")
-	bool.Name   = "Stunned"
-	bool.Parent = character
-	Debris:AddItem(bool, duration)
+local function applyStun(char, dur)
+	if not char then return end
+	StatusEffectUtil.Apply(char, "Hitstun", dur)
+	CombatState.ClearBlockOnStun(char)
 end
 
--- Scales impulse by AssemblyMass so knockback feels the same
--- regardless of how heavy the character rig is.
-local function applyImpulse(rootPart, direction, force)
-	if not rootPart or not rootPart.Parent then return end
-	if direction.Magnitude < 0.001 then return end
-	rootPart:ApplyImpulse(direction.Unit * force * rootPart.AssemblyMass)
+local function applyImpulse(root, dir, force)
+	if not root or not root.Parent then return end
+	if dir.Magnitude < 0.001 then return end
+	root:ApplyImpulse(dir.Unit * force * root.AssemblyMass)
 end
 
--- Plays the Hit animation child on the target's Animator.
--- Using track.Stopped to destroy ensures the anim finishes fully
--- before being cleaned up — the old Debris:AddItem(track, 0.3)
--- was destroying the track while it was still playing.
-local function playHitAnim(character)
-	local anim = getAnimator(character)
+local function applyKnockdown(char, knockType, dur)
+	if knockType == "soft" then KnockdownUtil.ApplySoftKnockdown(char, dur)
+	elseif knockType == "hard" then KnockdownUtil.ApplyHardKnockdown(char, dur) end
+end
+
+local function playHitAnim(char)
+	local anim = getAnimator(char)
 	if not anim or not script:FindFirstChild("Hit") then return end
-	local track = anim:LoadAnimation(script.Hit)
-	track:Play()
+	local track = anim:LoadAnimation(script.Hit); track:Play()
 	track.Stopped:Once(function() track:Destroy() end)
 end
 
--- Clones a Sound child from this Script and plays it at a location.
-local function playSound(soundName, parent)
-	local template = script:FindFirstChild(soundName)
-	if not template then return end
-	local snd = template:Clone()
-	snd.Parent = parent
-	snd:Play()
-	Debris:AddItem(snd, snd.TimeLength + 0.5)
+local function playHitSound(root, style)
+	if style and style.sounds and style.sounds.hitId
+		and style.sounds.hitId ~= "" and style.sounds.hitId ~= "rbxassetid://0"
+	then SoundUtil.Play(style.sounds.hitId, root); return end
+	local sounds = CombatData.GetSounds(
+		style and style.weaponType or "Fist",
+		style and style.styleName  or "Default"
+	)
+	if sounds.hitId and sounds.hitId ~= "" and sounds.hitId ~= "rbxassetid://0" then
+		SoundUtil.Play(sounds.hitId, root); return
+	end
+	local tpl = script:FindFirstChild("Punch Hit")
+	if tpl then local s=tpl:Clone(); s.Parent=root; s:Play(); Debris:AddItem(s,s.TimeLength+0.5) end
+end
+
+local function playParrySound(root)
+	local tpl = script:FindFirstChild("Parry Clash")
+	if tpl then local s=tpl:Clone(); s.Parent=root; s:Play(); Debris:AddItem(s,s.TimeLength+0.5) end
 end
 
 -- ============================================================
--- VFX — single burst, no double-play
--- The fix: disable all ParticleEmitters BEFORE parenting the
--- clone (preventing the automatic emission that happens when a
--- particle emitter is first replicated), then call Emit() once.
--- GetDescendants instead of GetChildren catches nested emitters.
+-- HITBOX  — MuchachoHitbox
+-- NOTE: hb:Stop() only — AutoDestroy handles cleanup.
+--       Calling hb:Destroy() after hb:Stop() was causing errors.
 -- ============================================================
-local function playHitVFX(targetRoot)
-	local punch01  = RS:FindFirstChild("Punch-01")
-	if not punch01 then return end
-	local main     = punch01:FindFirstChild("Main")
-	if not main then return end
-	local template = main:FindFirstChild("Hit1")
-	if not template then return end
-
-	local vfx = template:Clone()
-
-	for _, obj in ipairs(vfx:GetDescendants()) do
-		if obj:IsA("ParticleEmitter") then obj.Enabled = false end
-	end
-
-	vfx.Parent = targetRoot
-
-	for _, obj in ipairs(vfx:GetDescendants()) do
-		if obj:IsA("ParticleEmitter") then
-			obj:Emit(obj:GetAttribute("EmitCount") or 12)
-		end
-	end
-
-	Debris:AddItem(vfx, 2)
-end
-
--- ============================================================
--- HITBOX CAST — workspace:GetPartBoundsInBox
--- Instantaneous, synchronous, deduplicated.
--- Debug visualisation is now client-side only:
---   server fires CombatFeedback "DebugHitbox" to ONLY the
---   attacker if their debug flag is on. The client creates a
---   local Part that replicates to nobody else.
--- ============================================================
-local function castHitbox(attackerChar, def, attackerPlayer)
+local function castHitbox(attackerChar, def, attackerPlayer, onHitFn)
 	local root = attackerChar:FindFirstChild("HumanoidRootPart")
-	if not root then return {} end
+	if not root then return CONFIG.DEFAULT_HIT_WINDOW end
 
-	local params = OverlapParams.new()
-	params.FilterDescendantsInstances = { attackerChar }
-	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hitWindow = def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW
 
-	local boxCF    = root.CFrame * CFrame.new(0, 0, def.hitboxFwd)
-	local rawParts = workspace:GetPartBoundsInBox(boxCF, def.hitboxSize, params)
-
-	-- Fire hitbox data to ONLY the attacker's client for local rendering.
-	-- The server never touches workspace for this — that was the old bug.
+	-- Fire debug event to attacker's client for visualizer (no server-side viz)
 	if attackerPlayer and debugPlayers[attackerPlayer.UserId] then
-		CombatFB:FireClient(attackerPlayer, {
-			type = "DebugHitbox",
-			cf   = boxCF,
-			size = def.hitboxSize,
+		CombatFX:FireClient(attackerPlayer, {
+			type               = "DebugHitbox",
+			cf                 = root.CFrame * CFrame.new(0, 0, def.hitboxFwd or -4),
+			size               = def.hitboxSize or Vector3.new(5,5,5),
+			velocityPrediction = CONFIG.VELOCITY_PREDICTION,
+			vpTime             = CONFIG.VELOCITY_PREDICTION_TIME,
+			rootVelocity       = root.AssemblyLinearVelocity,
 		})
 	end
 
-	local results, seen = {}, {}
-	for _, part in ipairs(rawParts) do
-		local model = part.Parent
-		if model
-			and not seen[model]
-			and model ~= attackerChar
-			and model:FindFirstChildOfClass("Humanoid")
-		then
-			seen[model] = true
-			table.insert(results, model)
-		end
-	end
-	return results
+	local hb = MuchachoHitbox.CreateHitbox()
+	hb.Size               = def.hitboxSize or Vector3.new(5,5,5)
+	hb.CFrame             = root
+	hb.Offset             = CFrame.new(0, 0, def.hitboxFwd or -4)
+	hb.VelocityPrediction     = CONFIG.VELOCITY_PREDICTION
+	hb.VelocityPredictionTime = CONFIG.VELOCITY_PREDICTION_TIME
+	hb.Visualizer         = false   -- client-side visualizer only
+
+	hb.Touched:Connect(function(hit, humanoid)
+		if not humanoid then return end
+		local targetChar = humanoid.Parent
+		if not targetChar or targetChar == attackerChar then return end
+		if humanoid.Health <= 0 then return end
+		local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+		if not targetRoot then return end
+		if RagdollUtil.IsRagdolled(targetChar) then return end
+		onHitFn(targetChar, humanoid)
+	end)
+
+	hb:Start()
+	-- Stop after hitWindow; AutoDestroy = true means MuchachoHitbox cleans itself up.
+	-- DO NOT call hb:Destroy() — it is already destroyed by hb:Stop().
+	task.delay(hitWindow, function() hb:Stop() end)
+
+	return hitWindow
 end
 
 -- ============================================================
 -- CORE ATTACK HANDLER
--- Spawned via task.spawn so windupWait can yield freely without
--- blocking the OnServerEvent handler for other players.
 -- ============================================================
-local function handleAttack(attackerPlayer, def)
-	local attackerChar = attackerPlayer.Character
-	if not attackerChar then return end
-	local attackerRoot = attackerChar:FindFirstChild("HumanoidRootPart")
-	if not attackerRoot then return end
+local function handleAttack(attackerPlayer, def, style)
+	local attackerChar = attackerPlayer.Character; if not attackerChar then return end
+	local attackerRoot = attackerChar:FindFirstChild("HumanoidRootPart"); if not attackerRoot then return end
 	local attackerHum  = attackerChar:FindFirstChildOfClass("Humanoid")
 
-	-- Slow the attacker during their swing commitment window.
-	if attackerHum then
-		attackerHum.WalkSpeed = ATTACK_SPEED
-		task.delay(def.windupWait + 0.40, function()
-			if attackerHum and attackerHum.Parent then
-				attackerHum.WalkSpeed = NORMAL_SPEED
-			end
-		end)
+	CombatState.IncrementAttackCount(attackerPlayer)
+	if attackerHum then attackerHum.WalkSpeed = CONFIG.ATTACK_SPEED end
+
+	local function finalize()
+		local remaining = CombatState.DecrementAttackCount(attackerPlayer)
+		if remaining == 0 and attackerHum and attackerHum.Parent
+			and not StatusEffectUtil.BlocksAttack(attackerChar)
+		then
+			attackerHum.WalkSpeed = CONFIG.NORMAL_SPEED
+		end
 	end
 
-	-- Small forward lunge on the attacker.
-	applyImpulse(attackerRoot, attackerRoot.CFrame.LookVector, def.selfImpulse)
+	-- Velocity at start
+	local velDef = def.velocity
+	if velDef and (velDef.timing == "start" or velDef.timing == nil) then
+		MovementUtil.ApplyVelocity(attackerRoot, velDef)
+	end
+	if def.selfImpulse and def.selfImpulse > 0 then
+		applyImpulse(attackerRoot, attackerRoot.CFrame.LookVector, def.selfImpulse)
+	end
 
-	-- Wait until the animation hit-frame before casting the hitbox.
-	-- Re-validate after the yield — the attacker may have been stunned
-	-- or disconnected during the windup.
+	-- Interrupt flag: catches stun applied DURING windup
+	local interrupted = false
+	local interruptConn = attackerChar.ChildAdded:Connect(function(child)
+		if child.Name=="Stunned" or child.Name=="SoftKnockdown"
+			or child.Name=="HardKnockdown" or child.Name=="Ragdolled" then
+			interrupted = true
+		end
+	end)
+
 	task.wait(def.windupWait)
-	if not attackerChar.Parent then return end
-	if attackerChar:FindFirstChild("Stunned") then return end
+	interruptConn:Disconnect()
 
-	local hitChars = castHitbox(attackerChar, def, attackerPlayer)
+	if velDef and velDef.timing == "hit" then
+		MovementUtil.ApplyVelocity(attackerRoot, velDef)
+	end
 
-	for _, targetChar in ipairs(hitChars) do
-		local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
-		if not targetHum or targetHum.Health <= 0 then continue end
+	CombatState.SetAttacking(attackerPlayer, 0)
 
-		local targetRoot   = targetChar:FindFirstChild("HumanoidRootPart")
-		if not targetRoot then continue end
+	if not attackerChar.Parent              then finalize(); return end
+	if interrupted                          then finalize(); return end
+	if StatusEffectUtil.BlocksAttack(attackerChar) then finalize(); return end
 
-		if RagdollUtil.IsRagdolled(targetChar) then continue end
+	local attackDir = attackerRoot.CFrame.LookVector
 
+	local hitWindow = castHitbox(attackerChar, def, attackerPlayer, function(targetChar, humanoid)
+		local targetHum  = humanoid
+		local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+		local hitPos     = targetRoot and targetRoot.Position or Vector3.zero
 		local targetPlayer = Players:GetPlayerFromCharacter(targetChar)
 		local blockState   = CombatState.GetBlockState(targetChar)
 
-		-- ── Branch 1: PARRY ───────────────────────────────────
 		if blockState == "parrying" then
-			-- Perfect parry: zero damage, attacker stunned and pushed back.
-			applyStun(attackerChar, PARRY_STUN_TIME)
-			applyImpulse(attackerRoot, -attackerRoot.CFrame.LookVector, 22)
-			playSound("Parry Clash", targetRoot)
-
+			applyStun(attackerChar, CONFIG.PARRY_STUN_TIME)
+			applyImpulse(attackerRoot, -attackDir, 22)
+			playParrySound(targetRoot)
 			if targetPlayer then
 				CombatState.OnParrySuccess(targetPlayer)
-				CombatFB:FireClient(targetPlayer, { type = "ParrySuccess" })
+				-- Parry success is gameplay-critical → reliable
+				CombatFeedback:FireClient(targetPlayer, {type="ParrySuccess", pos=hitPos})
 			end
-			CombatFB:FireClient(attackerPlayer, { type = "ParriedByOpponent" })
-			continue
+			-- Attacker feedback → cosmetic (unreliable)
+			CombatFX:FireClient(attackerPlayer, {type="ParriedByOpponent", pos=hitPos})
+			return
 
-			-- ── Branch 2: BLOCK (regular attacks only) ────────────
-			-- Heavy attacks have breaksBlock = true and skip this branch.
 		elseif blockState == "blocking" and not def.breaksBlock then
-			local reduced = math.max(1, math.floor(def.damage * (1 - BLOCK_REDUCTION)))
+			local reduced = math.max(1, math.floor(def.damage*(1-CONFIG.BLOCK_REDUCTION)))
 			targetHum:TakeDamage(reduced)
-			applyImpulse(targetRoot, attackerRoot.CFrame.LookVector, 8)
-			playSound("Punch Hit", targetRoot)
-
+			applyImpulse(targetRoot, attackDir, 8)
+			playHitSound(targetRoot, style)
 			if targetPlayer then
-				CombatFB:FireClient(targetPlayer, { type = "BlockHit" })
+				-- BlockHit is cosmetic → unreliable
+				CombatFX:FireClient(targetPlayer, {type="BlockHit", pos=hitPos})
 			end
-			continue
+			return
 
-			-- ── Branch 3: GUARD BREAK ─────────────────────────────
-			-- Only reached when blockState == "blocking" AND breaksBlock == true.
-			-- Previously this fell through to full damage but never cleared
-			-- blockState — so every subsequent attack also "bypassed" guard.
-			-- Now we explicitly break the guard before applying damage.
 		elseif blockState == "blocking" and def.breaksBlock then
-			-- Clear blockState and stamp a guard-broken window.
-			-- After this, the target cannot re-guard for GUARD_BREAK_DURATION.
 			CombatState.BreakGuard(targetChar)
-
 			if targetPlayer then
-				CombatFB:FireClient(targetPlayer, { type = "GuardBroken" })
+				-- GuardBroken is gameplay-critical (client must stop blocking) → reliable
+				CombatFeedback:FireClient(targetPlayer, {type="GuardBroken", pos=hitPos})
 			end
-			-- Fall through: apply full damage below.
 		end
 
-		-- ── Branch 4: FULL HIT ────────────────────────────────
+		-- Full hit
 		targetHum:TakeDamage(def.damage)
-
-		local fwd   = attackerRoot.CFrame.LookVector
-		local kbDir = (fwd + Vector3.new(0, def.knockUpRatio, 0)).Unit
+		local kbDir = (attackDir + Vector3.new(0, def.knockUpRatio or 0.1, 0)).Unit
 		applyImpulse(targetRoot, kbDir, def.knockback)
-
 		applyStun(targetChar, def.stunTime)
 		playHitAnim(targetChar)
-		playHitVFX(targetRoot)
-		playSound("Punch Hit", targetRoot)
+		playHitSound(targetRoot, style)
 
-		-- Special moves can call RagdollUtil here.
-		-- Example (for a command grab finisher once grabs are added):
-		--   if def.ragdoll then
-		--       RagdollUtil.Ragdoll(targetChar, def.ragdollDuration, kbDir * def.knockback * 0.5)
-		--   end
+		-- Hit VFX → cosmetic (unreliable)
+		CombatFX:FireClient(attackerPlayer, {type="HitConnected", pos=hitPos})
+		if targetPlayer then
+			CombatFX:FireClient(targetPlayer, {type="YouWereHit", pos=hitPos})
+		end
+
+		-- Knockdown / ragdoll
+		if def.canSoftKnockdown then
+			applyKnockdown(targetChar, "soft", def.knockdownDuration)
+		elseif def.canHardKnockdown then
+			applyKnockdown(targetChar, "hard", def.knockdownDuration)
+		elseif def.ragdoll then
+			RagdollUtil.Ragdoll(targetChar, def.ragdollDuration or 2.5, kbDir*(def.knockback*0.4))
+		end
+	end)
+
+	task.wait(hitWindow or CONFIG.DEFAULT_HIT_WINDOW)
+
+	if def.endlag and def.endlag > 0 then
+		CombatState.SetEndlag(attackerPlayer, def.endlag)
 	end
+
+	finalize()
 end
 
 -- ============================================================
--- REMOTE: Combat  (client → server)
--- Payload must be a table with an "action" string field.
+-- REMOTE: Combat
+-- Client input → Server logic → Client output (via CombatFX)
 -- ============================================================
 Combat.OnServerEvent:Connect(function(player, data)
 	if typeof(data) ~= "table" or not data.action then return end
+	local character = player.Character; if not character then return end
+	if StatusEffectUtil.BlocksAttack(character)  then return end
+	if CombatState.IsInEndlag(player)            then return end
+	if not getEquippedTool(character)            then return end
 
-	local character = player.Character
-	if not character then return end
-	if character:FindFirstChild("Stunned") then return end
+	local state = CombatState.Get(player)
+	local now   = os.clock()
+	local style = getPlayerStyle(player); if not style then return end
 
-	local state  = CombatState.Get(player)
-	local now    = os.clock()
-	local action = data.action
+	-- ── M1 ─────────────────────────────────────────────────────
+	if data.action == "M1" then
+		if CombatState.IsAttacking(player) then return end
 
-	-- Load the player's current style module.
-	local style = getPlayerStyle(player)
-	if not style then return end
+		local timing = CombatData.GetTiming(
+			(player:FindFirstChild("Plr_WeaponType") and player.Plr_WeaponType.Value ~= "" and player.Plr_WeaponType.Value) or "Fist",
+			(player:FindFirstChild("Plr_StyleName")  and player.Plr_StyleName.Value  ~= "" and player.Plr_StyleName.Value)  or "Default"
+		)
+		local maxCombo = style.comboLength or timing.comboLength or 3
+		local comboIdx = CombatState.GetCombo(player)
 
-	if action == "Regular" or action == "Last" then
-		if now - state.lastLightTime < RATE_LIGHT then return end
-		state.lastLightTime = now
-		local def = style.attacks[action]
-		if def then task.spawn(handleAttack, player, def) end
+		local def, trackName
 
-	elseif action == "Heavy" then
-		if now - state.lastHeavyTime < RATE_HEAVY then return end
-		state.lastHeavyTime = now
-		state.lastLightTime = now   -- share the slot so you can't chain light after heavy
-		local def = style.attacks.Heavy
-		if def then task.spawn(handleAttack, player, def) end
-
-	elseif action == "BlockStart" then
-		-- Refuse if still inside a guard-break window.
-		if not CombatState.CanBlock(player) then return end
-
-		if state.parryExpireTask then
-			task.cancel(state.parryExpireTask)
-			state.parryExpireTask = nil
+		if comboIdx >= maxCombo then
+			-- Finisher
+			def       = style.attacks["Last"]
+			trackName = "M" .. maxCombo
+			if not def then return end
+			local serverCD = def.serverCD or CONFIG.RATE_FLOURISH
+			if now - state.lastFlourishTime < serverCD then return end
+			state.lastFlourishTime = now; state.lastLightTime = now
+			CombatState.ResetCombo(player)
+			CombatState.SetAttacking(player, def.windupWait + 0.05)
+		else
+			-- Regular combo hit
+			def = (style.attacks.comboHits and style.attacks.comboHits[comboIdx])
+				or style.attacks["Regular"]
+			trackName = "M" .. comboIdx
+			if not def then return end
+			local serverCD  = def.serverCD or CONFIG.RATE_LIGHT
+			if now - state.lastLightTime < serverCD then return end
+			state.lastLightTime = now
+			local resetTime = def.resetTimer or timing.comboReset or 1.5
+			CombatState.IncrementCombo(player, resetTime)
+			CombatState.SetAttacking(player, def.windupWait + 0.05)
 		end
 
+		-- Tell client which animation to play + which sound to play → unreliable
+		CombatFX:FireClient(player, {
+			type      = "PlayAttackAnim",
+			track     = trackName,
+			soundType = "swing",
+		})
+		task.spawn(handleAttack, player, def, style)
+
+		-- ── Heavy ──────────────────────────────────────────────────
+	elseif data.action == "Heavy" then
+		local def = style.attacks["Heavy"]; if not def then return end
+		local serverCD = def.serverCD or CONFIG.RATE_HEAVY
+		if now - state.lastHeavyTime < serverCD then return end
+		if CombatState.IsAttacking(player) then return end
+		state.lastHeavyTime = now; state.lastLightTime = now
+		CombatState.SetAttacking(player, def.windupWait + 0.05)
+
+		CombatFX:FireClient(player, {
+			type      = "PlayAttackAnim",
+			track     = "Heavy",
+			soundType = "swing",
+		})
+		task.spawn(handleAttack, player, def, style)
+
+		-- ── Block ──────────────────────────────────────────────────
+	elseif data.action == "BlockStart" then
+		if not CombatState.CanBlock(player) then return end
+		if state.parryExpireTask then task.cancel(state.parryExpireTask); state.parryExpireTask=nil end
 		if state.parryReady then
-			-- Open parry window. If nothing hits before it expires,
-			-- OnParryWhiff fires the punishment cooldown.
 			state.blockState = "parrying"
 			state.parryExpireTask = task.delay(CombatData.PARRY_WINDOW, function()
 				if state.blockState == "parrying" then
 					CombatState.OnParryWhiff(player)
-					CombatFB:FireClient(player, { type = "ParryWhiff" })
+					-- ParryWhiff is gameplay-critical → reliable
+					CombatFeedback:FireClient(player, {type="ParryWhiff"})
 				end
 				state.parryExpireTask = nil
 			end)
 		else
-			-- Parry on cooldown: go straight to regular block, no parry window.
 			state.blockState = "blocking"
 		end
 
-	elseif action == "BlockEnd" then
-		if state.parryExpireTask then
-			task.cancel(state.parryExpireTask)
-			state.parryExpireTask = nil
-		end
-		-- If player releases block while still in parry state,
-		-- the parry attempt was a quick tap that hit nothing — whiff.
+	elseif data.action == "BlockEnd" then
+		if state.parryExpireTask then task.cancel(state.parryExpireTask); state.parryExpireTask=nil end
 		if state.blockState == "parrying" then
 			CombatState.OnParryWhiff(player)
-			CombatFB:FireClient(player, { type = "ParryWhiff" })
+			CombatFeedback:FireClient(player, {type="ParryWhiff"})
 		end
 		state.blockState = nil
+
+		-- ── EvasiveDash ────────────────────────────────────────────
+	elseif data.action == "EvasiveDash" then
+		if not StatusEffectUtil.CanEvasiveDash(character) then return end
+		if not CombatState.CanEvasiveDash(player) then return end
+		task.spawn(MovementUtil.EvasiveDash, player, character)
+
+		-- ── NormalDash ─────────────────────────────────────────────
+	elseif data.action == "NormalDash" then
+		-- Normal dash has no CC requirement, just a cooldown.
+		if not CombatState.CanNormalDash(player) then return end
+		task.spawn(MovementUtil.NormalDash, player, character)
+
+		-- ── DashAttack ─────────────────────────────────────────────
+	elseif data.action == "DashAttack" then
+		if CombatState.IsAttacking(player) then return end
+		local dashDef = style.attacks.dashAttack; if not dashDef then return end
+		local helpers = {
+			applyStun=applyStun, applyImpulse=applyImpulse,
+			castHitbox=castHitbox, playHitAnim=playHitAnim,
+			playHitVFX=function() end, playHitSound=playHitSound,
+			CombatFB=CombatFX, applyKnockdown=applyKnockdown,
+		}
+		CombatState.SetAttacking(player, dashDef.dashDuration + 0.5)
+		task.spawn(MovementUtil.DashAttack, player, dashDef, style, helpers)
 	end
 end)
 
 -- ============================================================
--- REMOTE: GameSettings  (client → server)
--- Only DebugMode is server-relevant. Everything else in the
--- settings panel is handled purely on the client.
+-- REMOTE: UseSkill
 -- ============================================================
+UseSkill.OnServerEvent:Connect(function(player, data)
+	if typeof(data) ~= "table" or not data.skillId then return end
+	if CombatState.IsInEndlag(player) then return end
+	SkillSystem.ExecuteSkill(player, data.skillId)
+end)
+
+EquipSkillRE.OnServerEvent:Connect(function(player, data)
+	if typeof(data) ~= "table" or not data.skillId then return end
+	local ok, reason = SkillSystem.EquipSkill(player, data.skillId)
+	CombatFeedback:FireClient(player, {type="SkillEquipResult", skillId=data.skillId, success=ok, reason=reason or ""})
+end)
+
+UnequipSkillRE.OnServerEvent:Connect(function(player, data)
+	if typeof(data) ~= "table" or not data.skillId then return end
+	SkillSystem.UnequipSkill(player, data.skillId)
+end)
+
+-- ============================================================
+-- REMOTE: ChangeStyle
+-- ============================================================
+if ChangeStyle then
+	ChangeStyle.OnServerEvent:Connect(function(player, data)
+		if typeof(data) ~= "table" or not data.styleName then return end
+		local char = player.Character; if not char then return end
+		if not char:FindFirstChildOfClass("Tool") then return end
+		local wt = player:FindFirstChild("Plr_WeaponType")
+		local sn = player:FindFirstChild("Plr_StyleName")
+		if not wt or not sn then return end
+		local allowed = InventoryData.GetStyles(wt.Value)
+		for _, s in ipairs(allowed) do
+			if s == data.styleName then sn.Value = data.styleName; return end
+		end
+	end)
+end
+
 if GameSettingsRE then
 	GameSettingsRE.OnServerEvent:Connect(function(player, data)
 		if typeof(data) ~= "table" then return end
-		if data.setting == "DebugMode" then
-			debugPlayers[player.UserId] = data.value == true
-		end
+		if data.setting == "DebugMode" then debugPlayers[player.UserId]=data.value==true end
 	end)
 end
 
 Players.PlayerRemoving:Connect(function(player)
 	debugPlayers[player.UserId] = nil
+	if player.Character then StatusEffectUtil.ClearAll(player.Character) end
 end)
