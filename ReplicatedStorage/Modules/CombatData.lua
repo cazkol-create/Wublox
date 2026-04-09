@@ -1,61 +1,105 @@
 -- @ScriptType: ModuleScript
+-- @ScriptType: ModuleScript
 -- ============================================================
 --  CombatData.lua  |  ModuleScript
 --  Location: ReplicatedStorage/Modules/CombatData
 --
---  Single source of truth for constants that BOTH the client
---  and server need to agree on.  Damage and hitbox values
---  live in the style files (ServerStorage/CombatStyles/...).
---  This file only holds what the client legitimately needs:
---  timing windows for local feedback and per-style cooldowns.
+--  CHANGES:
+--    • comboLength added per style (3 or 4).
+--      CombatClient uses this to know when to play the finisher
+--      and send action="Last".
+--    • evasiveDashCD added (mirrors MovementUtil.EVASIVE_DASH_CD).
+--      CombatClient uses this for the local cooldown display.
 -- ============================================================
 
 local CombatData = {}
 
--- How long the parry window stays open after BlockStart.
--- Client uses this to time the parry flash VFX.
--- Server uses this in CombatState to schedule the whiff timer.
-CombatData.PARRY_WINDOW        = 0.35   -- seconds
+-- ── Parry / block / guard constants ──────────────────────────
+CombatData.PARRY_WINDOW         = 0.35
+CombatData.PARRY_PUNISH_CD      = 1.80
+CombatData.PARRY_RECOVER_CD     = 0.50
+CombatData.GUARD_BREAK_DURATION = 1.50
+CombatData.EVASIVE_DASH_CD      = 6.0   -- must match MovementUtil constant
 
--- Punishment cooldown after the parry window expires unused.
-CombatData.PARRY_PUNISH_CD     = 1.80   -- seconds
-
--- Short cooldown after a SUCCESSFUL parry before the next parry is available.
-CombatData.PARRY_RECOVER_CD    = 0.50   -- seconds
-
--- How long after a guard break the player cannot re-guard.
-CombatData.GUARD_BREAK_DURATION = 1.50  -- seconds
-
--- ── Per-style client timing hints ────────────────────────────
--- These control LOCAL client cooldowns and combo reset.
--- They should be set slightly above the server's windupWait so
--- the next combo input fires AFTER the previous hitbox, keeping
--- the visuals and physics in sync.
---
--- m1CD       : minimum seconds between M1 presses
--- lastRecovery: lock after the flourish (M3)
--- heavyCD    : minimum seconds between Heavy presses
--- comboReset : seconds of inactivity before combo resets to 1
+-- ── Per-style client timing ───────────────────────────────────
+-- m1CD         : minimum seconds between M1 presses
+-- lastRecovery : post-finisher lock time
+-- heavyCD      : minimum seconds between Heavy presses
+-- comboReset   : inactivity before combo counter resets to 1
+-- comboLength  : how many hits in the M1 chain (3 or 4)
+--                The last hit in the chain is always the "finisher".
 -- ─────────────────────────────────────────────────────────────
 CombatData.StyleTiming = {
-	Sword = {
-		Default = { m1CD = 0.95, lastRecovery = 1.50, heavyCD = 3.00, comboReset = 1.50 },
-		Flowing = { m1CD = 0.85, lastRecovery = 1.40, heavyCD = 2.80, comboReset = 1.40 },
-		Storm   = { m1CD = 0.80, lastRecovery = 1.30, heavyCD = 2.60, comboReset = 1.30 },
+
+	Fist = {
+		Default = {
+			m1CD         = 0.52,
+			lastRecovery = 1.20,
+			heavyCD      = 2.50,
+			comboReset   = 1.20,
+			comboLength  = 3,
+		},
 	},
-	-- Add more weapon families here as they are built.
+
+	Sword = {
+		Default = {
+			m1CD         = 0.95,
+			lastRecovery = 1.50,
+			heavyCD      = 3.00,
+			comboReset   = 1.50,
+			comboLength  = 3,
+		},
+		Flowing = {
+			m1CD         = 0.85,
+			lastRecovery = 1.40,
+			heavyCD      = 2.80,
+			comboReset   = 1.40,
+			comboLength  = 3,
+		},
+		Storm = {
+			m1CD         = 1.05,
+			lastRecovery = 1.60,
+			heavyCD      = 3.20,
+			comboReset   = 1.60,
+			comboLength  = 3,
+		},
+	},
+	
+	Staff = {
+		['Mad Monk'] = {
+			m1CD         = 0.67,
+			lastRecovery = 1.50,
+			heavyCD      = 2.70,
+			comboReset   = 1.1,
+			comboLength  = 3,
+		},
+	}
 }
 
--- Fallback timing used when a style has no entry in StyleTiming.
 CombatData.DefaultTiming = {
-	m1CD = 0.5, lastRecovery = 1.50, heavyCD = 3.00, comboReset = 1.00,
+	m1CD = 0.60, lastRecovery = 1.20, heavyCD = 2.50, comboReset = 1.20, comboLength = 3,
 }
 
--- Returns the timing table for the given weapon + style name.
 function CombatData.GetTiming(weaponType, styleName)
 	local wt = CombatData.StyleTiming[weaponType]
 	if wt and wt[styleName] then return wt[styleName] end
 	return CombatData.DefaultTiming
+end
+
+-- ── Sound asset IDs ───────────────────────────────────────────
+CombatData.StyleSounds = {
+	Fist  = { Default = { swingId = "rbxassetid://0", hitId = "rbxassetid://0" } },
+	Sword = {
+		Default = { swingId = "rbxassetid://0", hitId = "rbxassetid://0" },
+		Flowing = { swingId = "rbxassetid://0", hitId = "rbxassetid://0" },
+		Storm   = { swingId = "rbxassetid://0", hitId = "rbxassetid://0" },
+	},
+}
+
+function CombatData.GetSounds(weaponType, styleName)
+	local wt = CombatData.StyleSounds[weaponType]
+	if not wt then return { swingId = "", hitId = "" } end
+	return wt[styleName] or wt["Default"] or { swingId = "", hitId = "" }
 end
 
 return CombatData
