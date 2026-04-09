@@ -1,102 +1,199 @@
 -- @ScriptType: ModuleScript
+-- @ScriptType: ModuleScript
 -- ============================================================
 --  RagdollUtil.lua  |  ModuleScript
 --  Location: ServerScriptService/Modules/RagdollUtil
 --
---  Provides ragdoll and un-ragdoll for any character.
---  Called by special moves (command grabs, launch finishers, etc.)
---  Currently no grabs exist, so this acts as the framework
---  placeholder — any new special move just calls Ragdoll().
+--  BallSocketConstraint-based ragdoll.
 --
---  How it works:
---    1. PlatformStand disables Humanoid control so the physics
---       engine takes over the whole rig.
---    2. Disabling Motor6D joints un-welds limbs from the
---       HumanoidRootPart, letting them fall independently.
---    3. Small random angular impulses make the fall look alive.
---    4. After `duration` seconds, Motor6D is re-enabled and
---       PlatformStand is cleared — the character stands back up.
+--  FIXES:
+--    Player ragdoll physics — when the server ragdolls a player
+--    character, the server must claim network ownership of the
+--    character parts so its physics impulses actually replicate.
+--    Without this the client rejects the impulses (it owns the
+--    physics) and the body barely moves.  On recovery, ownership
+--    is returned to the player.
+--
+--    "Getting-up" snap — after unRagdoll we call
+--    Humanoid:ChangeState(GettingUp) which previously snapped
+--    the model instantly.  We now wait one frame after re-enabling
+--    Motor6D joints so the rig assembles itself before the state
+--    transition, preventing the visual pop.
 -- ============================================================
 
-local Debris = game:GetService("Debris")
+local Players    = game:GetService("Players")
+local Debris     = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+
+-- ── Developer config ──────────────────────────────────────────
+local CONFIG = {
+	angularImpulseMin  = -25,
+	angularImpulseMax  =  25,
+	applyEntryImpulse  = true,
+	-- Extra impulse applied upward when recovering from ragdoll to
+	-- help players stand up rather than sliding along the floor.
+	recoveryUpImpulse  = 20,
+}
 
 local RagdollUtil = {}
 
--- ── Ragdoll ───────────────────────────────────────────────────
--- character : Model with Humanoid + Motor6D-based rig
--- duration  : seconds before the character recovers
--- impulse   : optional extra Vector3 applied to the root on entry
-function RagdollUtil.Ragdoll(character, duration, impulse)
-	if not character or not character.Parent then return end
-
-	local hum  = character:FindFirstChildOfClass("Humanoid")
-	local root = character:FindFirstChild("HumanoidRootPart")
-	if not hum or not root then return end
-
-	-- Prevent multiple simultaneous ragdolls
-	if character:FindFirstChild("Ragdolled") then return end
-
-	local tag      = Instance.new("BoolValue")
-	tag.Name       = "Ragdolled"
-	tag.Parent     = character
-	Debris:AddItem(tag, duration)
-
-	-- Disable Humanoid so the physics engine takes full control
-	hum.PlatformStand = true
-
-	-- Optional launch impulse (e.g. for grab finishers)
-	if impulse and impulse.Magnitude > 0.001 then
-		root:ApplyImpulse(impulse * root.AssemblyMass)
+-- ── Network ownership helpers ─────────────────────────────────
+-- Claim physics ownership so server impulses replicate to everyone.
+local function claimOwnership(character)
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local ok = pcall(function() part:SetNetworkOwner(nil) end)
+		end
 	end
+end
 
-	-- Collect every Motor6D in the rig and disable it
-	local motors = {}
-	for _, v in ipairs(character:GetDescendants()) do
+-- Return ownership to the player (or server for NPCs).
+local function releaseOwnership(character)
+	local player = Players:GetPlayerFromCharacter(character)
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") then
+			pcall(function()
+				if player then
+					part:SetNetworkOwner(player)
+				else
+					part:SetNetworkOwner(nil) -- server for NPCs
+				end
+			end)
+		end
+	end
+end
+
+-- ── BallSocket ragdoll ────────────────────────────────────────
+local function performRagdoll(character)
+	for _, v in pairs(character:GetDescendants()) do
 		if v:IsA("Motor6D") then
-			v.Enabled = false
-			table.insert(motors, v)
+			local bs  = Instance.new("BallSocketConstraint")
+			local a0  = Instance.new("Attachment")
+			local a1  = Instance.new("Attachment")
+			a0.Parent = v.Part0
+			a1.Parent = v.Part1
+			a0.CFrame = v.C0
+			a1.CFrame = v.C1
+			bs.Attachment0           = a0
+			bs.Attachment1           = a1
+			bs.MaxFrictionTorque     = 200
+			bs.LimitsEnabled         = true
+			bs.TwistLimitsEnabled    = true
+			bs.Parent                = v.Parent
+			v.Enabled                = false
+		end
+	end
+	local hum = character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.RequiresNeck = false
+		hum.PlatformStand = true
+		hum:ChangeState(Enum.HumanoidStateType.Physics)
+	end
+end
+
+local function unRagdoll(character)
+	for _, v in pairs(character:GetDescendants()) do
+		if v:IsA("BallSocketConstraint") then
+			v:Destroy()
+		elseif v:IsA("Motor6D") then
+			v.Enabled = true
 		end
 	end
 
-	-- Apply small random angular impulses to limbs for a natural tumble
+	local hum  = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not hum then return end
+
+	hum.RequiresNeck  = true
+	hum.PlatformStand = false
+
+	-- Apply a small upward impulse so the character actually stands
+	-- up instead of sliding prone across the floor.
+	if root and CONFIG.recoveryUpImpulse > 0 then
+		root:ApplyImpulse(Vector3.new(0, CONFIG.recoveryUpImpulse, 0) * root.AssemblyMass)
+	end
+
+	-- Wait one frame for Motor6D re-assembly before changing state.
+	-- Without this the rig snaps into an ugly T-pose.
+	task.wait()
+	hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+end
+
+-- ============================================================
+-- PUBLIC: Ragdoll
+-- ============================================================
+function RagdollUtil.Ragdoll(character, duration, impulse)
+	if not character or not character.Parent then return end
+	local hum  = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not hum or not root then return end
+	if hum.Health <= 0 then return end
+	if character:FindFirstChild("Ragdolled") then return end
+
+	local tag = Instance.new("BoolValue")
+	tag.Name  = "Ragdolled"
+	tag.Parent = character
+	Debris:AddItem(tag, duration)
+
+	-- Claim network ownership so server-applied impulses replicate.
+	claimOwnership(character)
+
+	performRagdoll(character)
+
+	if CONFIG.applyEntryImpulse and impulse and impulse.Magnitude > 0.001 then
+		root:ApplyImpulse(impulse * root.AssemblyMass)
+	end
+
 	for _, part in ipairs(character:GetDescendants()) do
 		if part:IsA("BasePart") and part ~= root then
-			part.CanCollide = true
 			part:ApplyAngularImpulse(Vector3.new(
-				math.random(-30, 30),
-				math.random(-30, 30),
-				math.random(-30, 30)
+				math.random(CONFIG.angularImpulseMin, CONFIG.angularImpulseMax),
+				math.random(CONFIG.angularImpulseMin, CONFIG.angularImpulseMax),
+				math.random(CONFIG.angularImpulseMin, CONFIG.angularImpulseMax)
 				))
 		end
 	end
 
-	-- Recover after duration
 	task.delay(duration, function()
-		if not character.Parent then return end
-		if not hum or not hum.Parent then return end
-
-		-- Re-enable all joints to reassemble the rig
-		for _, motor in ipairs(motors) do
-			if motor.Parent then
-				motor.Enabled = true
-			end
-		end
-
-		-- Turn limb collision back off (Roblox characters have it off by default)
-		for _, part in ipairs(character:GetDescendants()) do
-			if part:IsA("BasePart") and part ~= root then
-				part.CanCollide = false
-			end
-		end
-
-		hum.PlatformStand = false
+		RagdollUtil._Recover(character, hum)
 	end)
 end
 
--- ── IsRagdolled ───────────────────────────────────────────────
--- Quick check used by other systems to skip attacking downed targets.
+-- ============================================================
+-- INTERNAL: _Recover
+-- ============================================================
+function RagdollUtil._Recover(character, hum)
+	if not character or not character.Parent then return end
+	if not hum or not hum.Parent then return end
+	if hum.Health <= 0 then return end
+
+	unRagdoll(character)
+
+	-- Return network ownership to its natural owner AFTER physics settle.
+	task.wait(0.1)
+	releaseOwnership(character)
+end
+
+-- ============================================================
+-- PUBLIC: ForceRecover
+-- ============================================================
+function RagdollUtil.ForceRecover(character)
+	if not character then return end
+	local tag = character:FindFirstChild("Ragdolled")
+	if tag then tag:Destroy() end
+	local hum = character:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Parent then
+		unRagdoll(character)
+		task.wait(0.1)
+		releaseOwnership(character)
+	end
+end
+
+-- ============================================================
+-- PUBLIC: IsRagdolled
+-- ============================================================
 function RagdollUtil.IsRagdolled(character)
-	return character:FindFirstChild("Ragdolled") ~= nil
+	return character ~= nil and character:FindFirstChild("Ragdolled") ~= nil
 end
 
 return RagdollUtil
