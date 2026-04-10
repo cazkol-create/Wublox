@@ -5,15 +5,17 @@
 --  Location: ServerScriptService/Modules/CombatState
 --
 --  CHANGES:
---    normalDashCooldownUntil — stamped by MovementUtil.NormalDash
---    CanNormalDash()         — checked by CombatServer
+--    • require(CombatData) replaced with require(CombatConfig).
+--      All CombatData.X constants are now read from CombatConfig.
+--    • normalDashCooldownUntil — stamped by MovementUtil.NormalDash.
+--    • CanNormalDash() — checked by CombatServer.
 -- ============================================================
 
-local Players    = game:GetService("Players")
-local CombatData = require(game.ReplicatedStorage.Modules.CombatData)
+local Players     = game:GetService("Players")
+local CombatConfig = require(script.Parent.CombatConfig)
 
 local CombatState = {}
-local pState = {}
+local pState      = {}
 
 local function newState()
 	return {
@@ -29,7 +31,7 @@ local function newState()
 		attackingClearTask       = nil,
 		activeAttackCount        = 0,
 		evasiveDashCooldownUntil = 0,
-		normalDashCooldownUntil  = 0,   -- NEW
+		normalDashCooldownUntil  = 0,
 		endlagUntil              = 0,
 		comboCount               = 1,
 		comboResetTask           = nil,
@@ -62,7 +64,7 @@ function CombatState.ResetCombo(player)
 	s.comboCount = 1
 end
 
--- ── Block / Parry ─────────────────────────────────────────────
+-- ── Block state ───────────────────────────────────────────────
 function CombatState.GetBlockState(character)
 	local player = Players:GetPlayerFromCharacter(character)
 	if player then
@@ -80,6 +82,7 @@ function CombatState.CanBlock(player)
 	return os.clock() >= s.guardBrokenUntil
 end
 
+-- ── Dash gates ────────────────────────────────────────────────
 function CombatState.CanEvasiveDash(player)
 	local s = pState[player.UserId]; if not s then return true end
 	return os.clock() >= s.evasiveDashCooldownUntil
@@ -107,7 +110,7 @@ function CombatState.OnParrySuccess(player)
 	if s.parryExpireTask then task.cancel(s.parryExpireTask); s.parryExpireTask = nil end
 	s.blockState = nil; s.parryReady = false
 	if s.parryCoolTask then task.cancel(s.parryCoolTask) end
-	s.parryCoolTask = task.delay(CombatData.PARRY_RECOVER_CD, function()
+	s.parryCoolTask = task.delay(CombatConfig.PARRY_RECOVER_CD, function()
 		s.parryReady = true; s.parryCoolTask = nil
 	end)
 end
@@ -116,7 +119,7 @@ function CombatState.OnParryWhiff(player)
 	local s = CombatState.Get(player)
 	s.parryReady = false; s.blockState = "blocking"
 	if s.parryCoolTask then task.cancel(s.parryCoolTask) end
-	s.parryCoolTask = task.delay(CombatData.PARRY_PUNISH_CD, function()
+	s.parryCoolTask = task.delay(CombatConfig.PARRY_PUNISH_CD, function()
 		s.parryReady = true; s.parryCoolTask = nil
 	end)
 end
@@ -128,8 +131,8 @@ function CombatState.BreakGuard(character)
 		if s.parryExpireTask then task.cancel(s.parryExpireTask); s.parryExpireTask = nil end
 		if s.parryCoolTask   then task.cancel(s.parryCoolTask);   s.parryCoolTask   = nil end
 		s.blockState = nil; s.parryReady = false
-		s.guardBrokenUntil = os.clock() + CombatData.GUARD_BREAK_DURATION
-		s.parryCoolTask = task.delay(CombatData.GUARD_BREAK_DURATION, function()
+		s.guardBrokenUntil = os.clock() + CombatConfig.GUARD_BREAK_DURATION
+		s.parryCoolTask = task.delay(CombatConfig.GUARD_BREAK_DURATION, function()
 			s.parryReady = true; s.parryCoolTask = nil
 		end)
 	else
@@ -180,6 +183,7 @@ function CombatState.ClearBlockOnStun(character)
 	CombatState.ResetCombo(player)
 end
 
+-- ── Cleanup ───────────────────────────────────────────────────
 function CombatState.Cleanup(player)
 	local s = pState[player.UserId]
 	if s then
