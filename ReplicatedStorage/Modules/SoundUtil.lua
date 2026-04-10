@@ -36,13 +36,13 @@ local SoundUtil = {}
 -- These are played whenever a style module does not provide its own.
 -- ============================================================
 local FALLBACK = {
-	hitId        = "rbxassetid://0",   -- generic melee impact
-	swingId      = "rbxassetid://0",   -- generic weapon whoosh
-	parryClashId = "rbxassetid://0",   -- metallic ring on successful parry
-	blockHitId   = "rbxassetid://0",   -- thud when a blocked hit lands
+	hitId        = "rbxassetid://99077189694355",   -- generic melee impact
+	swingId      = "rbxassetid://136811265205147",   -- generic weapon whoosh
+	parryClashId = "rbxassetid://131094450192090",   -- metallic ring on successful parry
+	blockHitId   = "rbxassetid://136811265205147",   -- thud when a blocked hit lands
 }
 
--- ── Default playback properties ───────────────────────────────
+-- ── Default playback properties ──────────────────────────────
 local DEFAULTS = {
 	Volume             = 0.85,
 	RollOffMaxDistance = 60,
