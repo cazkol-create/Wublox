@@ -1,12 +1,14 @@
 -- @ScriptType: ModuleScript
 -- @ScriptType: ModuleScript
--- Location: ServerStorage/CombatStyles/Sword/Default
+-- Location: ServerStorage/CombatStyles/Staff/Default
 return {
 	styleName  = "Mad Monk",
 	weaponType = "Staff",
+	comboLength = 3,
 
 	sounds = {
 		hitId = "rbxassetid://0",
+		swingId = "rbxassetid://0",
 	},
 
 	attacks = {
@@ -24,8 +26,8 @@ return {
 				breaksBlock  = false,
 				selfImpulse  = 14,
 				velocity     = { forward = 18, up = 0, duration = 0.20 },
-				serverCD     = 0.67,
-				resetTimer   = 1.1,
+				endlag     = 0.67,
+				resetTimer   = 0.97,
 			},
 			[2] = {
 				damage       = 12,
@@ -39,11 +41,11 @@ return {
 				breaksBlock  = false,
 				selfImpulse  = 14,
 				velocity     = { forward = 18, up = 0, duration = 0.20 },
-				serverCD     = 1.05,
-				resetTimer   = 1.1,
+				endlag     = 0.9,
+				resetTimer   = 1.2,
 			},
 		},
-
+--[[
 		Regular = {
 			damage       = 10,
 			knockback    = 30,
@@ -56,8 +58,8 @@ return {
 			breaksBlock  = false,
 			selfImpulse  = 14,
 			velocity     = { forward = 18, up = 0, duration = 0.20 },
-			serverCD     = 0.6,
-		},
+			endlag     = 0.6,
+		},]]
 
 		Last = {
 			damage            = 10,
@@ -75,7 +77,8 @@ return {
 			canSoftKnockdown  = false,
 			knockdownDuration = 2.5,
 			velocity          = { forward = 22, up = 2, duration = 0.30 },
-			serverCD          = 2.70,
+			serverCD          = 2.0,
+			endlag            = 0.80,
 		},
 
 		Heavy = {
