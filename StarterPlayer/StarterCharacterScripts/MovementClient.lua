@@ -5,15 +5,13 @@
 --  Location: StarterCharacterScripts
 --
 --  CHANGES:
---    • Directional dash — getDashDirection() reads the player's
---      current movement input and maps it to "forward", "back",
---      "left", or "right" relative to the character's facing.
---      The direction is sent alongside the NormalDash action.
---
---    • Endlag tracking — listens for CharacterFeedback "EndlagStart"
---      events fired by CombatServer after attack hitboxes resolve.
---      While in endlag, dashing is blocked locally (matches the
---      server-side block already in Combat.OnServerEvent).
+--    • Directional dash — getDashDirection() reads current WASD input.
+--    • Endlag tracking — CharacterFeedback "EndlagStart" blocks dashing.
+--    • JUMP COOLDOWN — humanoid.Jumping listener immediately disables
+--      jumping via SetStateEnabled for JUMP_COOLDOWN_SEC seconds after
+--      each jump.  This prevents bunny-hopping and gives jumps a more
+--      deliberate, wuxia-weighted feel.
+--      KEEP IN SYNC with CombatConfig.JUMP_COOLDOWN (server-side).
 -- ============================================================
 
 local Players       = game:GetService("Players")
@@ -40,7 +38,7 @@ local CONFIG = {
 	MOVE_STOP_THRESHOLD   = 0.05,
 
 	DASH_KEYBIND          = Enum.KeyCode.LeftShift,
-	DASH_COOLDOWN         = 3.0,    -- client visual; server enforces actual CD
+	DASH_COOLDOWN         = 3.0,
 	AUTO_SPRINT_AFTER_DASH= true,
 
 	EVASIVE_DASH_KEYBIND  = Enum.KeyCode.E,
@@ -48,6 +46,11 @@ local CONFIG = {
 
 	SHIFT_LOCK_KEYBIND    = Enum.KeyCode.LeftControl,
 	SHIFT_LOCK_OFFSET     = Vector3.new(2, 0, 0),
+
+	-- ── Jump cooldown ─────────────────────────────────────────
+	-- Mirror of CombatConfig.JUMP_COOLDOWN on the server.
+	-- Both values must be kept in sync manually.
+	JUMP_COOLDOWN         = 0.5,
 }
 
 -- ============================================================
@@ -59,9 +62,7 @@ local evasiveAvailable = true
 local sprintHeartbeat  = nil
 local lastWTapTime     = 0
 
--- ── Endlag tracking ───────────────────────────────────────────
--- Updated by CharacterFeedback "EndlagStart".
--- While time() < endlagExpiry, dashing is blocked.
+-- Endlag tracking (updated by CharacterFeedback "EndlagStart")
 local endlagExpiry = 0
 local function isInEndlag() return time() < endlagExpiry end
 
@@ -119,12 +120,6 @@ end)
 
 -- ============================================================
 -- DIRECTION DETECTION
--- Maps the player's current movement input to a dash direction
--- relative to the character's facing direction.
---
--- Roblox attachment-local space: -Z = forward, +Z = back
--- humanoid.MoveDirection is in world space.
--- We project it into character-local space to determine intent.
 -- ============================================================
 local function getDashDirection()
 	local root = character:FindFirstChild("HumanoidRootPart")
@@ -132,20 +127,15 @@ local function getDashDirection()
 
 	local moveDir = humanoid.MoveDirection
 	if moveDir.Magnitude < CONFIG.MOVE_STOP_THRESHOLD then
-		return "forward"   -- no directional input → forward dash
+		return "forward"
 	end
 
-	-- Project world-space move direction into local space of HRP.
-	-- localDir.X = right/left  (+ = right)
-	-- localDir.Z = backward/forward (- = forward in Roblox)
 	local localDir = root.CFrame:VectorToObjectSpace(moveDir).Unit
 	local ax, az   = math.abs(localDir.X), math.abs(localDir.Z)
 
 	if az >= ax then
-		-- Predominantly forward/back
 		return localDir.Z < 0 and "forward" or "back"
 	else
-		-- Predominantly left/right
 		return localDir.X > 0 and "right" or "left"
 	end
 end
@@ -154,9 +144,9 @@ end
 -- NORMAL DASH
 -- ============================================================
 local function doDash()
-	if isInEndlag()        then return end   -- endlag blocks dashing
-	if not dashAvailable   then return end
-	if isCCed()            then return end
+	if isInEndlag()      then return end
+	if not dashAvailable then return end
+	if isCCed()          then return end
 
 	dashAvailable = false
 	task.delay(CONFIG.DASH_COOLDOWN, function() dashAvailable = true end)
@@ -164,7 +154,6 @@ local function doDash()
 	local direction = getDashDirection()
 	Combat:FireServer({ action = "NormalDash", direction = direction })
 
-	-- Auto-sprint after a forward dash
 	if CONFIG.AUTO_SPRINT_AFTER_DASH and direction == "forward" then
 		task.delay(0.4, function()
 			if not isCCed() then startSprint() end
@@ -198,7 +187,7 @@ CAS:BindAction("Movement_EvasiveDash", function(_, state, _)
 end, false, CONFIG.EVASIVE_DASH_KEYBIND)
 
 -- ============================================================
--- SHIFT LOCK (Left Alt toggle)
+-- SHIFT LOCK
 -- ============================================================
 if CONFIG.SHIFT_LOCK_KEYBIND then
 	local UserGameSettings = UserSettings():GetService("UserGameSettings")
@@ -226,8 +215,6 @@ end
 
 -- ============================================================
 -- CHARACTER FEEDBACK
--- ── EndlagStart: block dashing for the specified duration ────
--- Fired by CombatServer after each attack's hitbox resolves.
 -- ============================================================
 if CharacterFeedback then
 	CharacterFeedback.OnClientEvent:Connect(function(data)
@@ -239,14 +226,38 @@ if CharacterFeedback then
 end
 
 -- ============================================================
+-- JUMP COOLDOWN
+-- ============================================================
+-- When the humanoid starts a jump, disable jumping for JUMP_COOLDOWN seconds.
+-- The current jump still completes normally (physics are already applied),
+-- but the player cannot immediately jump again until the cooldown expires.
+-- This mirrors CombatConfig.JUMP_COOLDOWN — keep both values in sync.
+do
+	humanoid.Jumping:Connect(function(active)
+		if not active then return end
+		-- Immediately lock out the next jump.
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		task.delay(CONFIG.JUMP_COOLDOWN, function()
+			if humanoid and humanoid.Parent then
+				humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+			end
+		end)
+	end)
+end
+
+-- ============================================================
 -- DEATH / RESPAWN
 -- ============================================================
 player.CharacterAdded:Connect(function()
-	isSprinting    = false
-	dashAvailable  = true
+	isSprinting      = false
+	dashAvailable    = true
 	evasiveAvailable = true
-	endlagExpiry   = 0
+	endlagExpiry     = 0
 	if sprintHeartbeat then sprintHeartbeat:Disconnect(); sprintHeartbeat = nil end
+	-- Re-enable jumping in case the character died mid-cooldown.
+	if humanoid then
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+	end
 end)
 
 -- ============================================================
