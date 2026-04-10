@@ -50,7 +50,7 @@ local CONFIG = {
 	-- ── Jump cooldown ─────────────────────────────────────────
 	-- Mirror of CombatConfig.JUMP_COOLDOWN on the server.
 	-- Both values must be kept in sync manually.
-	JUMP_COOLDOWN         = 0.5,
+	JUMP_COOLDOWN         = 1.5,
 }
 
 -- ============================================================
