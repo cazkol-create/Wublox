@@ -4,31 +4,34 @@
 --  CombatServer.lua  |  Script  (NOT ModuleScript)
 --  Location: ServerScriptService
 --
---  CHANGES:
---    1. CombatData removed entirely.
---       • PARRY_WINDOW → CombatConfig.PARRY_WINDOW
---       • GetSounds    → SoundUtil.PlayHit / PlayParryClash
---       • GetTiming (maxCombo, comboReset) → read from style module directly
+--  FIXES applied in this version:
 --
---    2. Block slow — BlockStart sets WalkSpeed = CombatConfig.BLOCK_SPEED.
---       BlockEnd / stun restores to NORMAL_SPEED.
+--  1. PARRY STUN (WalkSpeed = 0 now persists)
+--     finalize() previously restored WalkSpeed unconditionally, overwriting
+--     the WalkSpeed = 0 that StatusEffectUtil.Hitstun applies when an
+--     attacker is parried.  Now finalize() skips the restoration if the
+--     attacker is currently CC'd — StatusEffectUtil.onRemove restores
+--     speed automatically when the effect expires.
 --
---    3. Dead player check — all combat actions are rejected if
---       the attacker's Humanoid.Health <= 0.
+--  2. GHOST M1 PREVENTION
+--     Endlag is now stamped SYNCHRONOUSLY (before task.spawn) in the
+--     OnServerEvent handler.  Previously it was set inside the spawned
+--     coroutine, leaving a one-frame window where a second M1 could slip
+--     through before the flag was written.
+--     handleAttack then OVERWRITES it with def.endlag (post-hit window)
+--     once the hitbox resolves.
 --
---    4. Cooldown redefinition
---       • Regular M1 combo hits: ONLY endlag gate (no serverCD check).
---         Endlag prevents all actions briefly after each hit.
---       • Last (finisher) and Heavy: BOTH endlag AND serverCD gates.
---         serverCD is the per-action cooldown that prevents reuse.
+--  3. GLOBAL SWING SOUNDS
+--     SoundUtil.PlaySwing() is now called server-side at the top of
+--     handleAttack.  This creates a Sound on the attacker's HRP in
+--     workspace, which Roblox replicates to all clients automatically.
+--     Previously swing sounds were only played client-side (attacker only).
+--     NOTE: fill in swingId / hitId in each style module and in
+--     SoundUtil.FALLBACK to restore actual audio.  All "rbxassetid://0"
+--     values are silent placeholders.
 --
---    5. Endlag notification — after the hitbox fires, if def.endlag > 0
---       the server fires CharacterFeedback "EndlagStart" so MovementClient
---       can block the dash immediately on the local client.
---
---    6. Directional NormalDash — MovementClient sends data.direction
---       ("forward" | "left" | "right" | "back"). Passed through to
---       MovementUtil.NormalDash which applies the correct velocity.
+--  4. EndlagStart CharacterFeedback is now uncommented so MovementClient's
+--     local endlag tracker stays in sync with the server.
 -- ============================================================
 
 local Players    = game:GetService("Players")
@@ -68,12 +71,8 @@ local CombatFX          = getOrCreate(RS, "CombatFX",          "UnreliableRemote
 -- DEVELOPER CONFIG
 -- ============================================================
 local CONFIG = {
-	-- Fallback serverCDs used when def.serverCD is absent.
-	-- In practice every style module should define its own serverCD
-	-- on Last and Heavy so these are only a safety net.
-	RATE_FLOURISH = 2.20,
-	RATE_HEAVY    = 2.00,
-
+	RATE_FLOURISH            = 2.20,
+	RATE_HEAVY               = 2.00,
 	DEFAULT_HIT_WINDOW       = 0.15,
 	VELOCITY_PREDICTION      = true,
 	VELOCITY_PREDICTION_TIME = 0.15,
@@ -107,7 +106,6 @@ local function getPlayerStyle(player)
 	)
 end
 
--- Derive maxCombo from the style module without needing CombatData.
 local function getMaxCombo(style)
 	if style.comboLength then return style.comboLength end
 	if style.attacks and style.attacks.comboHits then
@@ -115,7 +113,7 @@ local function getMaxCombo(style)
 		for _ in pairs(style.attacks.comboHits) do n += 1 end
 		if n > 0 then return n end
 	end
-	return 3  -- safe default
+	return 3
 end
 
 Players.PlayerAdded:Connect(function(player)
@@ -168,8 +166,7 @@ local function playHitAnim(char)
 end
 
 -- ============================================================
--- HITBOX  — MuchachoHitbox
--- NOTE: hb:Stop() only — AutoDestroy handles cleanup.
+-- HITBOX  — MuchachoHitbox  (DO NOT MODIFY THIS SECTION)
 -- ============================================================
 local function castHitbox(attackerChar, def, attackerPlayer, onHitFn)
 	local root = attackerChar:FindFirstChild("HumanoidRootPart")
@@ -219,12 +216,23 @@ local function handleAttack(attackerPlayer, def, style)
 	local attackerRoot = attackerChar:FindFirstChild("HumanoidRootPart"); if not attackerRoot then return end
 	local attackerHum  = attackerChar:FindFirstChildOfClass("Humanoid")
 
-	
-	--CombatState.IncrementAttackCount(attackerPlayer)
+	-- ── FIX #3: Global swing sound ────────────────────────────
+	-- Server-side Sound creation replicates to ALL clients automatically.
+	-- Fill in swingId in each style module (and SoundUtil.FALLBACK) with
+	-- a real rbxassetid to restore audio.
+	SoundUtil.PlaySwing(attackerRoot, style)
+
+	-- ── FIX #1: Parry-stun aware finalize ────────────────────
+	-- If the attacker is currently CC'd (e.g. parried → Hitstun),
+	-- StatusEffectUtil's onRemove callback will restore WalkSpeed when the
+	-- effect expires.  Overwriting it here would cancel the stun.
 	local function finalize()
 		local remaining = CombatState.DecrementAttackCount(attackerPlayer)
 		if remaining == 0 and attackerHum and attackerHum.Parent then
-			-- Restore correct speed based on current state
+			if StatusEffectUtil.BlocksAttack(attackerChar) then
+				-- Character is CC'd — let the status-effect system restore speed.
+				return
+			end
 			local state = CombatState.Get(attackerPlayer)
 			attackerHum.WalkSpeed = state.blockState
 				and CombatConfig.BLOCK_SPEED
@@ -234,25 +242,11 @@ local function handleAttack(attackerPlayer, def, style)
 
 	if attackerHum then attackerHum.WalkSpeed = CombatConfig.ATTACK_SPEED end
 
-	-- Set endlag and notify client so MovementClient can block dashing
-	if def.endlag and def.endlag > 0 then
-		CombatState.SetEndlag(attackerPlayer, def.endlag)
-		--[[CharacterFeedback:FireClient(attackerPlayer, {
-			type     = "EndlagStart",
-			duration = def.endlag,
-		})]]
-	end
-	
 	-- Velocity at attack start (timing = "start" or absent)
 	local velDef = def.velocity
 	if velDef and (velDef.timing == "start" or velDef.timing == nil) then
 		MovementUtil.ApplyVelocity(attackerRoot, velDef)
 	end
-	
-	--[[
-	if def.selfImpulse and def.selfImpulse > 0 then
-		applyImpulse(attackerRoot, attackerRoot.CFrame.LookVector, def.selfImpulse)
-	end]]
 
 	task.wait(def.windupWait or 0)
 
@@ -261,11 +255,24 @@ local function handleAttack(attackerPlayer, def, style)
 		MovementUtil.ApplyVelocity(attackerRoot, velDef)
 	end
 
-	-- Release the isAttacking lock right as the hitbox fires
+	-- Release the isAttacking lock as the hitbox fires.
 	CombatState.SetAttacking(attackerPlayer, 0)
 
 	if not attackerChar.Parent then finalize(); return end
 	if StatusEffectUtil.BlocksAttack(attackerChar) then finalize(); return end
+
+	-- ── FIX #2: Post-hit endlag update ────────────────────────
+	-- The synchronous pre-lock (set in OnServerEvent before task.spawn)
+	-- prevented ghost M1s during windup.  Now we EXTEND it to the actual
+	-- post-hit endlag window and notify the client so MovementClient can
+	-- also block dashing for the correct duration.
+	if def.endlag and def.endlag > 0 then
+		CombatState.SetEndlag(attackerPlayer, def.endlag)
+		CharacterFeedback:FireClient(attackerPlayer, {
+			type     = "EndlagStart",
+			duration = def.endlag,
+		})
+	end
 
 	local attackDir = attackerRoot.CFrame.LookVector
 
@@ -279,6 +286,8 @@ local function handleAttack(attackerPlayer, def, style)
 
 		-- ── Parry ─────────────────────────────────────────────
 		if blockState == "parrying" then
+			-- applyStun sets WalkSpeed = 0 via StatusEffectUtil.Hitstun.
+			-- finalize() will NOT override this (FIX #1 above).
 			applyStun(attackerChar, CombatConfig.PARRY_STUN_TIME)
 			applyImpulse(attackerRoot, -attackDir, 22)
 			SoundUtil.PlayParryClash(targetRoot)
@@ -336,59 +345,65 @@ end
 -- ============================================================
 -- REMOTE: Combat
 -- ============================================================
-local ongoingM1 = {}
-
 Combat.OnServerEvent:Connect(function(player, data)
 	if not data.action then return end
-	
+
 	local character = player.Character
 	if not character then return end
-	
+
 	local hum = character:FindFirstChildOfClass("Humanoid")
 	if not hum or hum.Health <= 0 then return end
-	
+
 	if StatusEffectUtil.BlocksAttack(character) then return end
-	if CombatState.IsInEndlag(player)          	then return end
+	if CombatState.IsInEndlag(player)           then return end
 	if not getEquippedTool(character)           then return end
-	
+
 	local style = getPlayerStyle(player)
 	if not style then return end
-	
+
 	local state = CombatState.Get(player)
-	
 	local now   = os.clock()
-		-- ── M1 ────────────────────────────────────────────────────
+
+	-- ── M1 ────────────────────────────────────────────────────
 	if data.action == "M1" then
-		
-		if now - state.lastFlourishTime < style.attacks.Last.serverCD then return end
-		
+
+		if now - state.lastFlourishTime < (style.attacks.Last and style.attacks.Last.serverCD or CONFIG.RATE_FLOURISH) then return end
+
 		local maxCombo  = getMaxCombo(style)
 		local comboIdx  = CombatState.GetCombo(player)
 		local def, trackName
-		
+
 		if comboIdx >= maxCombo then
-			-- Finisher (Last) — has serverCD
+			-- Finisher (Last) — has its own serverCD
 			def       = style.attacks["Last"]
 			trackName = "M" .. maxCombo
 			if not def then return end
 
-			local serverCD = def.serverCD or CONFIG.RATE_FLOURISH
-			state.lastFlourishTime = now; state.lastLightTime = now
+			state.lastFlourishTime = now
+			state.lastLightTime    = now
 			CombatState.ResetCombo(player)
-			CombatState.SetAttacking(player, (def.windupWait + def.hitWindow or 0) + 0.05)
+			CombatState.SetAttacking(player, (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + 0.05)
 		else
-			-- Regular combo hit — NO serverCD check, only endlag gates
+			-- Regular combo hit — endlag is the only gate between hits
 			def = (style.attacks.comboHits and style.attacks.comboHits[comboIdx]) or style.attacks["Regular"]
 			trackName = "M" .. comboIdx
 			if not def then return end
-			-- Note: no 'now - state.lastLightTime < serverCD' check here.
-			-- Endlag (set after previous hit) is the only gate for regular M1s.
+
 			state.lastLightTime = now
 			local resetTime = def.resetTimer or 1.5
 			CombatState.IncrementCombo(player, resetTime)
-			CombatState.SetAttacking(player, (def.windupWait + def.hitWindow or 0) + 0.05)
+			CombatState.SetAttacking(player, (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + 0.05)
 		end
-		-- Tell client: which animation + which swing sound (style-specific)
+
+		-- ── FIX #2: Synchronous pre-lock (ghost-M1 prevention) ──
+		-- Stamp endlag BEFORE task.spawn so a second M1 arriving in the
+		-- same server step cannot slip through the IsInEndlag check.
+		-- handleAttack will OVERWRITE this with def.endlag (post-hit window)
+		-- once the hitbox resolves, extending the lock if needed.
+		local preLockDur = (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + 0.1
+		CombatState.SetEndlag(player, preLockDur)
+
+		-- Tell client which animation + swing sound to use.
 		CombatFX:FireClient(player, {
 			type      = "PlayAttackAnim",
 			track     = trackName,
@@ -397,15 +412,22 @@ Combat.OnServerEvent:Connect(function(player, data)
 		})
 
 		task.spawn(handleAttack, player, def, style)
+
 		-- ── Heavy ─────────────────────────────────────────────────
 	elseif data.action == "Heavy" then
 		local def = style.attacks["Heavy"]; if not def then return end
-		-- Heavy: serverCD gate
+
 		local serverCD = def.serverCD or CONFIG.RATE_HEAVY
 		if now - state.lastHeavyTime < serverCD then return end
 		if CombatState.IsAttacking(player) then return end
-		state.lastHeavyTime = now; state.lastLightTime = now
+
+		state.lastHeavyTime = now
+		state.lastLightTime = now
 		CombatState.SetAttacking(player, (def.windupWait or 0) + 0.05)
+
+		-- Synchronous pre-lock for Heavy too
+		local preLockDur = (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + 0.1
+		CombatState.SetEndlag(player, preLockDur)
 
 		CombatFX:FireClient(player, {
 			type      = "PlayAttackAnim",
@@ -420,7 +442,6 @@ Combat.OnServerEvent:Connect(function(player, data)
 		if not CombatState.CanBlock(player) then return end
 		if state.parryExpireTask then task.cancel(state.parryExpireTask); state.parryExpireTask=nil end
 
-		-- Slow the player while blocking
 		if hum then hum.WalkSpeed = CombatConfig.BLOCK_SPEED end
 
 		if state.parryReady then
@@ -444,7 +465,6 @@ Combat.OnServerEvent:Connect(function(player, data)
 		end
 		state.blockState = nil
 
-		-- Restore normal speed when unblocking
 		if hum then hum.WalkSpeed = CombatConfig.NORMAL_SPEED end
 
 		-- ── Evasive Dash ──────────────────────────────────────────
@@ -456,8 +476,6 @@ Combat.OnServerEvent:Connect(function(player, data)
 		-- ── Normal Dash (with direction) ──────────────────────────
 	elseif data.action == "NormalDash" then
 		if not CombatState.CanNormalDash(player) then return end
-		-- data.direction: "forward" | "left" | "right" | "back"
-		-- (sent by MovementClient based on held WASD keys)
 		task.spawn(MovementUtil.NormalDash, player, character, data.direction)
 
 		-- ── Dash Attack ───────────────────────────────────────────
