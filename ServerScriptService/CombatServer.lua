@@ -1,32 +1,33 @@
 -- @ScriptType: Script
--- @ScriptType: Script
 -- ============================================================
 --  CombatServer.lua  |  Script  (NOT ModuleScript)
 --  Location: ServerScriptService
 --
---  PIPELINE: Client input → Server logic → Client output (visuals)
---
 --  CHANGES:
---    CombatFX (UnreliableRemoteEvent) — ALL cosmetic events
---      (attack animations, hit effects, sounds, VFX) are fired
---      through this unreliable channel.  These are visual flare
---      only; the game remains correct even if a packet drops.
+--    1. CombatData removed entirely.
+--       • PARRY_WINDOW → CombatConfig.PARRY_WINDOW
+--       • GetSounds    → SoundUtil.PlayHit / PlayParryClash
+--       • GetTiming (maxCombo, comboReset) → read from style module directly
 --
---    CombatFeedback (RemoteEvent, reliable) — gameplay-critical
---      events only: ParrySuccess, GuardBroken, ParryWhiff,
---      SkillCooldown, SkillEquipResult.
+--    2. Block slow — BlockStart sets WalkSpeed = CombatConfig.BLOCK_SPEED.
+--       BlockEnd / stun restores to NORMAL_SPEED.
 --
---    MuchachoHitbox fix — hb:Stop() only; MuchachoHitbox has
---      AutoDestroy = true by default so the hitbox cleans itself
---      up on Stop.  Calling Destroy() after Stop was causing the
---      "attempt to destroy already-destroyed object" error.
+--    3. Dead player check — all combat actions are rejected if
+--       the attacker's Humanoid.Health <= 0.
 --
---    Server-side combo — CombatState.GetCombo() / IncrementCombo()
---      own the combo counter.  Client sends action="M1" with no
---      index; server picks the correct comboHit def and tells the
---      client which animation to play via CombatFX.
+--    4. Cooldown redefinition
+--       • Regular M1 combo hits: ONLY endlag gate (no serverCD check).
+--         Endlag prevents all actions briefly after each hit.
+--       • Last (finisher) and Heavy: BOTH endlag AND serverCD gates.
+--         serverCD is the per-action cooldown that prevents reuse.
 --
---    NormalDash action — handled here; delegates to MovementUtil.
+--    5. Endlag notification — after the hitbox fires, if def.endlag > 0
+--       the server fires CharacterFeedback "EndlagStart" so MovementClient
+--       can block the dash immediately on the local client.
+--
+--    6. Directional NormalDash — MovementClient sends data.direction
+--       ("forward" | "left" | "right" | "back"). Passed through to
+--       MovementUtil.NormalDash which applies the correct velocity.
 -- ============================================================
 
 local Players    = game:GetService("Players")
@@ -34,7 +35,7 @@ local SS         = game:GetService("ServerStorage")
 local Debris     = game:GetService("Debris")
 local RS         = game:GetService("ReplicatedStorage")
 
-local CombatData      = require(RS.Modules.CombatData)
+local CombatConfig    = require(script.Parent.Modules.CombatConfig)
 local CombatState     = require(script.Parent.Modules.CombatState)
 local RagdollUtil     = require(script.Parent.Modules.RagdollUtil)
 local StatusEffectUtil= require(script.Parent.Modules.StatusEffectUtil)
@@ -45,41 +46,36 @@ local MuchachoHitbox  = require(script.Parent.Modules.MuchachoHitbox)
 local SoundUtil       = require(RS.Modules.SoundUtil)
 local InventoryData   = require(RS.Modules.InventoryData)
 
--- ── Remote helpers ────────────────────────────────────────────
+-- ── Remotes ───────────────────────────────────────────────────
 local function getOrCreate(parent, name, class)
 	local e = parent:FindFirstChild(name)
 	if e then return e end
 	local obj = Instance.new(class); obj.Name = name; obj.Parent = parent; return obj
 end
 
--- Reliable: gameplay-critical events
 local Combat            = RS:WaitForChild("Combat")
-local CombatFeedback    = RS:WaitForChild("CombatFeedback")    -- ReliableRemoteEvent
+local CombatFeedback    = RS:WaitForChild("CombatFeedback")
 local GameSettingsRE    = RS:WaitForChild("GameSettings", 5)
 local ChangeStyle       = RS:WaitForChild("ChangeStyle", 15)
 local UseSkill          = getOrCreate(RS, "UseSkill",          "RemoteEvent")
 local EquipSkillRE      = getOrCreate(RS, "EquipSkill",        "RemoteEvent")
 local UnequipSkillRE    = getOrCreate(RS, "UnequipSkill",      "RemoteEvent")
 local CharacterFeedback = getOrCreate(RS, "CharacterFeedback", "RemoteEvent")
-
--- Unreliable: all cosmetic output (animations, VFX, sounds)
--- UnreliableRemoteEvent — packets may drop; that is acceptable for visual flare.
-local CombatFX = getOrCreate(RS, "CombatFX", "UnreliableRemoteEvent")
+local CombatFX          = getOrCreate(RS, "CombatFX",          "UnreliableRemoteEvent")
 
 -- ============================================================
 -- DEVELOPER CONFIG
 -- ============================================================
 local CONFIG = {
-	NORMAL_SPEED    = 16,
-	ATTACK_SPEED    = 7,
-	PARRY_STUN_TIME = 1.80,
-	BLOCK_REDUCTION = 0.70,
-	RATE_LIGHT      = 0.45,   -- fallback when def.serverCD absent
-	RATE_HEAVY      = 2.00,
-	RATE_FLOURISH   = 2.20,
-	DEFAULT_HIT_WINDOW      = 0.15,
-	VELOCITY_PREDICTION     = true,
-	VELOCITY_PREDICTION_TIME= 0.15,
+	-- Fallback serverCDs used when def.serverCD is absent.
+	-- In practice every style module should define its own serverCD
+	-- on Last and Heavy so these are only a safety net.
+	RATE_FLOURISH = 2.20,
+	RATE_HEAVY    = 2.00,
+
+	DEFAULT_HIT_WINDOW       = 0.15,
+	VELOCITY_PREDICTION      = true,
+	VELOCITY_PREDICTION_TIME = 0.15,
 }
 
 local debugPlayers = {}
@@ -110,13 +106,24 @@ local function getPlayerStyle(player)
 	)
 end
 
+-- Derive maxCombo from the style module without needing CombatData.
+local function getMaxCombo(style)
+	if style.comboLength then return style.comboLength end
+	if style.attacks and style.attacks.comboHits then
+		local n = 0
+		for _ in pairs(style.attacks.comboHits) do n += 1 end
+		if n > 0 then return n end
+	end
+	return 3  -- safe default
+end
+
 Players.PlayerAdded:Connect(function(player)
 	local function sv(name, val)
 		if not player:FindFirstChild(name) then
 			local v=Instance.new("StringValue"); v.Name=name; v.Value=val; v.Parent=player
 		end
 	end
-	sv("Plr_WeaponType", ""); sv("Plr_StyleName", "")
+	sv("Plr_WeaponType",""); sv("Plr_StyleName","")
 	SkillSystem.InitPlayer(player)
 end)
 
@@ -159,30 +166,9 @@ local function playHitAnim(char)
 	track.Stopped:Once(function() track:Destroy() end)
 end
 
-local function playHitSound(root, style)
-	if style and style.sounds and style.sounds.hitId
-		and style.sounds.hitId ~= "" and style.sounds.hitId ~= "rbxassetid://0"
-	then SoundUtil.Play(style.sounds.hitId, root); return end
-	local sounds = CombatData.GetSounds(
-		style and style.weaponType or "Fist",
-		style and style.styleName  or "Default"
-	)
-	if sounds.hitId and sounds.hitId ~= "" and sounds.hitId ~= "rbxassetid://0" then
-		SoundUtil.Play(sounds.hitId, root); return
-	end
-	local tpl = script:FindFirstChild("Punch Hit")
-	if tpl then local s=tpl:Clone(); s.Parent=root; s:Play(); Debris:AddItem(s,s.TimeLength+0.5) end
-end
-
-local function playParrySound(root)
-	local tpl = script:FindFirstChild("Parry Clash")
-	if tpl then local s=tpl:Clone(); s.Parent=root; s:Play(); Debris:AddItem(s,s.TimeLength+0.5) end
-end
-
 -- ============================================================
 -- HITBOX  — MuchachoHitbox
 -- NOTE: hb:Stop() only — AutoDestroy handles cleanup.
---       Calling hb:Destroy() after hb:Stop() was causing errors.
 -- ============================================================
 local function castHitbox(attackerChar, def, attackerPlayer, onHitFn)
 	local root = attackerChar:FindFirstChild("HumanoidRootPart")
@@ -190,7 +176,6 @@ local function castHitbox(attackerChar, def, attackerPlayer, onHitFn)
 
 	local hitWindow = def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW
 
-	-- Fire debug event to attacker's client for visualizer (no server-side viz)
 	if attackerPlayer and debugPlayers[attackerPlayer.UserId] then
 		CombatFX:FireClient(attackerPlayer, {
 			type               = "DebugHitbox",
@@ -198,17 +183,16 @@ local function castHitbox(attackerChar, def, attackerPlayer, onHitFn)
 			size               = def.hitboxSize or Vector3.new(5,5,5),
 			velocityPrediction = CONFIG.VELOCITY_PREDICTION,
 			vpTime             = CONFIG.VELOCITY_PREDICTION_TIME,
-			rootVelocity       = root.AssemblyLinearVelocity,
 		})
 	end
 
 	local hb = MuchachoHitbox.CreateHitbox()
-	hb.Size               = def.hitboxSize or Vector3.new(5,5,5)
-	hb.CFrame             = root
-	hb.Offset             = CFrame.new(0, 0, def.hitboxFwd or -4)
-	hb.VelocityPrediction     = CONFIG.VELOCITY_PREDICTION
-	hb.VelocityPredictionTime = CONFIG.VELOCITY_PREDICTION_TIME
-	hb.Visualizer         = false   -- client-side visualizer only
+	hb.Size            = def.hitboxSize or Vector3.new(5,5,5)
+	hb.CFrame          = root
+	hb.Offset          = CFrame.new(0, 0, def.hitboxFwd or -4)
+	hb.FilterCharacter = attackerChar
+	hb.HitOnce         = true
+	hb.Visualizer      = false
 
 	hb.Touched:Connect(function(hit, humanoid)
 		if not humanoid then return end
@@ -222,10 +206,7 @@ local function castHitbox(attackerChar, def, attackerPlayer, onHitFn)
 	end)
 
 	hb:Start()
-	-- Stop after hitWindow; AutoDestroy = true means MuchachoHitbox cleans itself up.
-	-- DO NOT call hb:Destroy() — it is already destroyed by hb:Stop().
 	task.delay(hitWindow, function() hb:Stop() end)
-
 	return hitWindow
 end
 
@@ -237,47 +218,52 @@ local function handleAttack(attackerPlayer, def, style)
 	local attackerRoot = attackerChar:FindFirstChild("HumanoidRootPart"); if not attackerRoot then return end
 	local attackerHum  = attackerChar:FindFirstChildOfClass("Humanoid")
 
-	CombatState.IncrementAttackCount(attackerPlayer)
-	if attackerHum then attackerHum.WalkSpeed = CONFIG.ATTACK_SPEED end
-
+	
+	--CombatState.IncrementAttackCount(attackerPlayer)
 	local function finalize()
 		local remaining = CombatState.DecrementAttackCount(attackerPlayer)
-		if remaining == 0 and attackerHum and attackerHum.Parent
-			and not StatusEffectUtil.BlocksAttack(attackerChar)
-		then
-			attackerHum.WalkSpeed = CONFIG.NORMAL_SPEED
+		if remaining == 0 and attackerHum and attackerHum.Parent then
+			-- Restore correct speed based on current state
+			local state = CombatState.Get(attackerPlayer)
+			attackerHum.WalkSpeed = state.blockState
+				and CombatConfig.BLOCK_SPEED
+				or  CombatConfig.NORMAL_SPEED
 		end
 	end
 
-	-- Velocity at start
+	if attackerHum then attackerHum.WalkSpeed = CombatConfig.ATTACK_SPEED end
+
+	-- Set endlag and notify client so MovementClient can block dashing
+	if def.endlag and def.endlag > 0 then
+		CombatState.SetEndlag(attackerPlayer, def.endlag)
+		--[[CharacterFeedback:FireClient(attackerPlayer, {
+			type     = "EndlagStart",
+			duration = def.endlag,
+		})]]
+	end
+	
+	-- Velocity at attack start (timing = "start" or absent)
 	local velDef = def.velocity
 	if velDef and (velDef.timing == "start" or velDef.timing == nil) then
 		MovementUtil.ApplyVelocity(attackerRoot, velDef)
 	end
+	
+	--[[
 	if def.selfImpulse and def.selfImpulse > 0 then
 		applyImpulse(attackerRoot, attackerRoot.CFrame.LookVector, def.selfImpulse)
-	end
+	end]]
 
-	-- Interrupt flag: catches stun applied DURING windup
-	local interrupted = false
-	local interruptConn = attackerChar.ChildAdded:Connect(function(child)
-		if child.Name=="Stunned" or child.Name=="SoftKnockdown"
-			or child.Name=="HardKnockdown" or child.Name=="Ragdolled" then
-			interrupted = true
-		end
-	end)
+	task.wait(def.windupWait or 0)
 
-	task.wait(def.windupWait)
-	interruptConn:Disconnect()
-
+	-- Velocity at hit frame (timing = "hit")
 	if velDef and velDef.timing == "hit" then
 		MovementUtil.ApplyVelocity(attackerRoot, velDef)
 	end
 
+	-- Release the isAttacking lock right as the hitbox fires
 	CombatState.SetAttacking(attackerPlayer, 0)
 
-	if not attackerChar.Parent              then finalize(); return end
-	if interrupted                          then finalize(); return end
+	if not attackerChar.Parent then finalize(); return end
 	if StatusEffectUtil.BlocksAttack(attackerChar) then finalize(); return end
 
 	local attackDir = attackerRoot.CFrame.LookVector
@@ -285,55 +271,52 @@ local function handleAttack(attackerPlayer, def, style)
 	local hitWindow = castHitbox(attackerChar, def, attackerPlayer, function(targetChar, humanoid)
 		local targetHum  = humanoid
 		local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
-		local hitPos     = targetRoot and targetRoot.Position or Vector3.zero
+		if not targetRoot then return end
+		local hitPos       = targetRoot.Position
 		local targetPlayer = Players:GetPlayerFromCharacter(targetChar)
 		local blockState   = CombatState.GetBlockState(targetChar)
 
+		-- ── Parry ─────────────────────────────────────────────
 		if blockState == "parrying" then
-			applyStun(attackerChar, CONFIG.PARRY_STUN_TIME)
+			applyStun(attackerChar, CombatConfig.PARRY_STUN_TIME)
 			applyImpulse(attackerRoot, -attackDir, 22)
-			playParrySound(targetRoot)
+			SoundUtil.PlayParryClash(targetRoot)
 			if targetPlayer then
 				CombatState.OnParrySuccess(targetPlayer)
-				-- Parry success is gameplay-critical → reliable
 				CombatFeedback:FireClient(targetPlayer, {type="ParrySuccess", pos=hitPos})
 			end
-			-- Attacker feedback → cosmetic (unreliable)
-			CombatFX:FireClient(attackerPlayer, {type="ParriedByOpponent", pos=hitPos})
+			CombatFeedback:FireClient(attackerPlayer, {type="ParriedByOpponent", pos=hitPos})
 			return
 
+				-- ── Block ─────────────────────────────────────────────
 		elseif blockState == "blocking" and not def.breaksBlock then
-			local reduced = math.max(1, math.floor(def.damage*(1-CONFIG.BLOCK_REDUCTION)))
+			local reduced = math.max(1, math.floor(def.damage*(1-CombatConfig.BLOCK_REDUCTION)))
 			targetHum:TakeDamage(reduced)
 			applyImpulse(targetRoot, attackDir, 8)
-			playHitSound(targetRoot, style)
-			if targetPlayer then
-				-- BlockHit is cosmetic → unreliable
-				CombatFX:FireClient(targetPlayer, {type="BlockHit", pos=hitPos})
-			end
+			SoundUtil.PlayBlockHit(targetRoot)
+			if targetPlayer then CombatFX:FireClient(targetPlayer, {type="BlockHit", pos=hitPos}) end
 			return
 
+				-- ── Guard Break ───────────────────────────────────────
 		elseif blockState == "blocking" and def.breaksBlock then
 			CombatState.BreakGuard(targetChar)
 			if targetPlayer then
-				-- GuardBroken is gameplay-critical (client must stop blocking) → reliable
 				CombatFeedback:FireClient(targetPlayer, {type="GuardBroken", pos=hitPos})
 			end
+			-- Fall through to full hit
 		end
 
-		-- Full hit
+		-- ── Full Hit ──────────────────────────────────────────
 		targetHum:TakeDamage(def.damage)
 		local kbDir = (attackDir + Vector3.new(0, def.knockUpRatio or 0.1, 0)).Unit
 		applyImpulse(targetRoot, kbDir, def.knockback)
 		applyStun(targetChar, def.stunTime)
 		playHitAnim(targetChar)
-		playHitSound(targetRoot, style)
+		SoundUtil.PlayHit(targetRoot, style)
 
-		-- Hit VFX → cosmetic (unreliable)
+		-- Unreliable: cosmetic hit events
 		CombatFX:FireClient(attackerPlayer, {type="HitConnected", pos=hitPos})
-		if targetPlayer then
-			CombatFX:FireClient(targetPlayer, {type="YouWereHit", pos=hitPos})
-		end
+		if targetPlayer then CombatFX:FireClient(targetPlayer, {type="YouWereHit", pos=hitPos}) end
 
 		-- Knockdown / ragdoll
 		if def.canSoftKnockdown then
@@ -346,100 +329,104 @@ local function handleAttack(attackerPlayer, def, style)
 	end)
 
 	task.wait(hitWindow or CONFIG.DEFAULT_HIT_WINDOW)
-
-	if def.endlag and def.endlag > 0 then
-		CombatState.SetEndlag(attackerPlayer, def.endlag)
-	end
-
 	finalize()
 end
 
 -- ============================================================
 -- REMOTE: Combat
--- Client input → Server logic → Client output (via CombatFX)
 -- ============================================================
+local ongoingM1 = {}
+
 Combat.OnServerEvent:Connect(function(player, data)
-	if typeof(data) ~= "table" or not data.action then return end
-	local character = player.Character; if not character then return end
-	if StatusEffectUtil.BlocksAttack(character)  then return end
-	if CombatState.IsInEndlag(player)            then return end
-	if not getEquippedTool(character)            then return end
-
+	if not data.action then return end
+	
+	local character = player.Character
+	if not character then return end
+	
+	local hum = character:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return end
+	
+	if StatusEffectUtil.BlocksAttack(character) then return end
+	if CombatState.IsInEndlag(player)          	then return end
+	if not getEquippedTool(character)           then return end
+	
+	local style = getPlayerStyle(player)
+	if not style then return end
+	
 	local state = CombatState.Get(player)
+	
 	local now   = os.clock()
-	local style = getPlayerStyle(player); if not style then return end
-
-	-- ── M1 ─────────────────────────────────────────────────────
+		-- ── M1 ────────────────────────────────────────────────────
 	if data.action == "M1" then
-		if CombatState.IsAttacking(player) then return end
-
-		local timing = CombatData.GetTiming(
-			(player:FindFirstChild("Plr_WeaponType") and player.Plr_WeaponType.Value ~= "" and player.Plr_WeaponType.Value) or "Fist",
-			(player:FindFirstChild("Plr_StyleName")  and player.Plr_StyleName.Value  ~= "" and player.Plr_StyleName.Value)  or "Default"
-		)
-		local maxCombo = style.comboLength or timing.comboLength or 3
-		local comboIdx = CombatState.GetCombo(player)
-
+		
+		if now - state.lastFlourishTime < style.attacks.Last.serverCD then return end
+		
+		local maxCombo  = getMaxCombo(style)
+		local comboIdx  = CombatState.GetCombo(player)
 		local def, trackName
-
+		
 		if comboIdx >= maxCombo then
-			-- Finisher
+			-- Finisher (Last) — has serverCD
 			def       = style.attacks["Last"]
 			trackName = "M" .. maxCombo
 			if not def then return end
+
 			local serverCD = def.serverCD or CONFIG.RATE_FLOURISH
-			if now - state.lastFlourishTime < serverCD then return end
 			state.lastFlourishTime = now; state.lastLightTime = now
 			CombatState.ResetCombo(player)
-			CombatState.SetAttacking(player, def.windupWait + 0.05)
+			CombatState.SetAttacking(player, (def.windupWait + def.hitWindow or 0) + 0.05)
 		else
-			-- Regular combo hit
-			def = (style.attacks.comboHits and style.attacks.comboHits[comboIdx])
-				or style.attacks["Regular"]
+			-- Regular combo hit — NO serverCD check, only endlag gates
+			def = (style.attacks.comboHits and style.attacks.comboHits[comboIdx]) or style.attacks["Regular"]
 			trackName = "M" .. comboIdx
 			if not def then return end
-			local serverCD  = def.serverCD or CONFIG.RATE_LIGHT
-			if now - state.lastLightTime < serverCD then return end
+			-- Note: no 'now - state.lastLightTime < serverCD' check here.
+			-- Endlag (set after previous hit) is the only gate for regular M1s.
 			state.lastLightTime = now
-			local resetTime = def.resetTimer or timing.comboReset or 1.5
+			local resetTime = def.resetTimer or 1.5
 			CombatState.IncrementCombo(player, resetTime)
-			CombatState.SetAttacking(player, def.windupWait + 0.05)
+			CombatState.SetAttacking(player, (def.windupWait + def.hitWindow or 0) + 0.05)
 		end
-
-		-- Tell client which animation to play + which sound to play → unreliable
+		-- Tell client: which animation + which swing sound (style-specific)
 		CombatFX:FireClient(player, {
 			type      = "PlayAttackAnim",
 			track     = trackName,
 			soundType = "swing",
+			swingId   = style.sounds and style.sounds.swingId or "",
 		})
-		task.spawn(handleAttack, player, def, style)
 
-		-- ── Heavy ──────────────────────────────────────────────────
+		task.spawn(handleAttack, player, def, style)
+		-- ── Heavy ─────────────────────────────────────────────────
 	elseif data.action == "Heavy" then
 		local def = style.attacks["Heavy"]; if not def then return end
+		-- Heavy: serverCD gate
 		local serverCD = def.serverCD or CONFIG.RATE_HEAVY
 		if now - state.lastHeavyTime < serverCD then return end
 		if CombatState.IsAttacking(player) then return end
 		state.lastHeavyTime = now; state.lastLightTime = now
-		CombatState.SetAttacking(player, def.windupWait + 0.05)
+		CombatState.SetAttacking(player, (def.windupWait or 0) + 0.05)
 
 		CombatFX:FireClient(player, {
 			type      = "PlayAttackAnim",
 			track     = "Heavy",
 			soundType = "swing",
+			swingId   = style.sounds and style.sounds.swingId or "",
 		})
 		task.spawn(handleAttack, player, def, style)
 
-		-- ── Block ──────────────────────────────────────────────────
+		-- ── Block ─────────────────────────────────────────────────
 	elseif data.action == "BlockStart" then
 		if not CombatState.CanBlock(player) then return end
 		if state.parryExpireTask then task.cancel(state.parryExpireTask); state.parryExpireTask=nil end
+
+		-- Slow the player while blocking
+		if hum then hum.WalkSpeed = CombatConfig.BLOCK_SPEED end
+
 		if state.parryReady then
 			state.blockState = "parrying"
-			state.parryExpireTask = task.delay(CombatData.PARRY_WINDOW, function()
+			state.parryExpireTask = task.delay(CombatConfig.PARRY_WINDOW, function()
 				if state.blockState == "parrying" then
 					CombatState.OnParryWhiff(player)
-					-- ParryWhiff is gameplay-critical → reliable
 					CombatFeedback:FireClient(player, {type="ParryWhiff"})
 				end
 				state.parryExpireTask = nil
@@ -456,26 +443,30 @@ Combat.OnServerEvent:Connect(function(player, data)
 		end
 		state.blockState = nil
 
-		-- ── EvasiveDash ────────────────────────────────────────────
+		-- Restore normal speed when unblocking
+		if hum then hum.WalkSpeed = CombatConfig.NORMAL_SPEED end
+
+		-- ── Evasive Dash ──────────────────────────────────────────
 	elseif data.action == "EvasiveDash" then
 		if not StatusEffectUtil.CanEvasiveDash(character) then return end
 		if not CombatState.CanEvasiveDash(player) then return end
 		task.spawn(MovementUtil.EvasiveDash, player, character)
 
-		-- ── NormalDash ─────────────────────────────────────────────
+		-- ── Normal Dash (with direction) ──────────────────────────
 	elseif data.action == "NormalDash" then
-		-- Normal dash has no CC requirement, just a cooldown.
 		if not CombatState.CanNormalDash(player) then return end
-		task.spawn(MovementUtil.NormalDash, player, character)
+		-- data.direction: "forward" | "left" | "right" | "back"
+		-- (sent by MovementClient based on held WASD keys)
+		task.spawn(MovementUtil.NormalDash, player, character, data.direction)
 
-		-- ── DashAttack ─────────────────────────────────────────────
+		-- ── Dash Attack ───────────────────────────────────────────
 	elseif data.action == "DashAttack" then
 		if CombatState.IsAttacking(player) then return end
 		local dashDef = style.attacks.dashAttack; if not dashDef then return end
 		local helpers = {
 			applyStun=applyStun, applyImpulse=applyImpulse,
 			castHitbox=castHitbox, playHitAnim=playHitAnim,
-			playHitVFX=function() end, playHitSound=playHitSound,
+			playHitVFX=function() end, playHitSound=function(r,s) SoundUtil.PlayHit(r,s) end,
 			CombatFB=CombatFX, applyKnockdown=applyKnockdown,
 		}
 		CombatState.SetAttacking(player, dashDef.dashDuration + 0.5)
@@ -516,7 +507,7 @@ if ChangeStyle then
 		if not wt or not sn then return end
 		local allowed = InventoryData.GetStyles(wt.Value)
 		for _, s in ipairs(allowed) do
-			if s == data.styleName then sn.Value = data.styleName; return end
+			if s == data.styleName then sn.Value=data.styleName; return end
 		end
 	end)
 end
