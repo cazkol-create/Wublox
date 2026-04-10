@@ -1,54 +1,120 @@
 -- @ScriptType: ModuleScript
+-- @ScriptType: ModuleScript
 -- ============================================================
 --  SoundUtil.lua  |  ModuleScript
 --  Location: ReplicatedStorage/Modules/SoundUtil
 --
---  Plays a sound at a BasePart by asset ID without requiring
---  pre-baked Sound children in every script.
---  Works on both the server and any LocalScript.
+--  CHANGES:
+--    Added FALLBACK_SOUNDS — centralised fallback IDs for every
+--    generic combat sound.  Fill these in with your actual asset
+--    IDs; leave as "rbxassetid://0" to silence that slot.
 --
---  Usage:
---    local SoundUtil = require(RS.Modules.SoundUtil)
---    SoundUtil.Play("rbxassetid://12345", somePart)
---    SoundUtil.Play("rbxassetid://12345", somePart, { Volume = 0.8, RollOffMaxDistance = 40 })
+--    Added helper functions that check the style module's
+--    optional sounds table first, then fall back to FALLBACK_SOUNDS:
+--      SoundUtil.PlayHit(root, style?)
+--      SoundUtil.PlaySwing(root, style?)
+--      SoundUtil.PlayParryClash(root)
+--      SoundUtil.PlayBlockHit(root)
+--
+--    Style modules may now include an optional `sounds` table:
+--      sounds = {
+--        hitId   = "rbxassetid://XXXX",   -- overrides generic hit
+--        swingId = "rbxassetid://XXXX",   -- overrides generic swing
+--      }
+--    Any field that is absent or "rbxassetid://0" falls back to
+--    the centralized FALLBACK_SOUNDS below.
+--
+--  CombatData.GetSounds() is no longer needed and can be removed.
 -- ============================================================
 
-local Debris  = game:GetService("Debris")
-
+local Debris = game:GetService("Debris")
 local SoundUtil = {}
 
--- Default properties applied to every sound unless overridden.
-local DEFAULTS = {
-	Volume              = 0.85,
-	RollOffMaxDistance  = 60,
-	RollOffMode         = Enum.RollOffMode.Linear,
+-- ============================================================
+-- FALLBACK SOUNDS
+-- Replace each "rbxassetid://0" with your actual sound asset ID.
+-- These are played whenever a style module does not provide its own.
+-- ============================================================
+local FALLBACK = {
+	hitId        = "rbxassetid://0",   -- generic melee impact
+	swingId      = "rbxassetid://0",   -- generic weapon whoosh
+	parryClashId = "rbxassetid://0",   -- metallic ring on successful parry
+	blockHitId   = "rbxassetid://0",   -- thud when a blocked hit lands
 }
 
--- Plays a sound at `parent` (must be a BasePart or Attachment).
--- `overrides` is an optional table of Sound property overrides.
--- The Sound is destroyed as soon as it finishes playing (or after maxLife
--- seconds as a safety cap so orphaned sounds never linger).
-function SoundUtil.Play(assetId, parent, overrides)
-	if not assetId or assetId == "" then return end
-	if not parent  or not parent.Parent then return end
+-- ── Default playback properties ───────────────────────────────
+local DEFAULTS = {
+	Volume             = 0.85,
+	RollOffMaxDistance = 60,
+	RollOffMode        = Enum.RollOffMode.Linear,
+}
 
+-- ============================================================
+-- INTERNAL: play a single sound ID at a BasePart or Attachment
+-- ============================================================
+local function _play(assetId, parent, overrides)
+	if not assetId or assetId == "" or assetId == "rbxassetid://0" then return end
+	if not parent  or not parent.Parent then return end
 	local snd = Instance.new("Sound")
 	snd.SoundId = assetId
-
-	-- Apply defaults then any caller overrides.
 	for k, v in pairs(DEFAULTS) do snd[k] = v end
-	if overrides then
-		for k, v in pairs(overrides) do snd[k] = v end
-	end
-
+	if overrides then for k, v in pairs(overrides) do snd[k] = v end end
 	snd.Parent = parent
 	snd:Play()
-
-	-- Destroy after playback. TimeLength is 0 until the sound has loaded;
-	-- give it a moment then check, falling back to a 5-second cap.
-	local maxLife = math.max(snd.TimeLength + 0.5, 5)
-	Debris:AddItem(snd, maxLife)
+	Debris:AddItem(snd, math.max(snd.TimeLength + 0.5, 5))
 end
 
+-- ============================================================
+-- PUBLIC: generic one-shot play (unchanged from original)
+-- ============================================================
+function SoundUtil.Play(assetId, parent, overrides)
+	_play(assetId, parent, overrides)
+end
+
+-- ============================================================
+-- PUBLIC: PlayHit
+-- Plays the hit/impact sound.
+-- style is optional — if it has sounds.hitId we use that first.
+-- ============================================================
+function SoundUtil.PlayHit(root, style)
+	local id = (style and style.sounds
+		and style.sounds.hitId
+		and style.sounds.hitId ~= ""
+		and style.sounds.hitId ~= "rbxassetid://0"
+		and style.sounds.hitId)
+		or FALLBACK.hitId
+	_play(id, root)
+end
+
+-- ============================================================
+-- PUBLIC: PlaySwing
+-- Plays the weapon swing / whoosh sound.
+-- style is optional.
+-- ============================================================
+function SoundUtil.PlaySwing(root, style)
+	local id = (style and style.sounds
+		and style.sounds.swingId
+		and style.sounds.swingId ~= ""
+		and style.sounds.swingId ~= "rbxassetid://0"
+		and style.sounds.swingId)
+		or FALLBACK.swingId
+	_play(id, root)
+end
+
+-- ============================================================
+-- PUBLIC: PlayParryClash
+-- Metallic ring played when a parry succeeds.
+-- ============================================================
+function SoundUtil.PlayParryClash(root)
+	_play(FALLBACK.parryClashId, root)
+end
+
+-- ============================================================
+-- PUBLIC: PlayBlockHit
+-- Thud when an attack is blocked.
+-- ============================================================
+function SoundUtil.PlayBlockHit(root)
+	_play(FALLBACK.blockHitId, root)
+end
 
 return SoundUtil
