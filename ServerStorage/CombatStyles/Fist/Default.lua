@@ -1,12 +1,27 @@
 -- @ScriptType: ModuleScript
 -- @ScriptType: ModuleScript
--- Location: ServerStorage/CombatStyles/Fist/Default
+-- ============================================================
+--  Default.lua  |  ModuleScript
+--  Location: ServerStorage/CombatStyles/Fist/Default
+--
+--  CHANGES:
+--    • comboHits now use `endlag` instead of `serverCD` for
+--      the post-hit window.  Regular M1s NO LONGER have serverCD;
+--      endlag is the only gate between consecutive hits.
+--    • serverCD is kept on Last and Heavy only (per new design).
+--    • comboLength field added so CombatServer can read it
+--      directly without needing CombatData.GetTiming().
+-- ============================================================
+
 return {
-	styleName  = "Default",
-	weaponType = "Fist",
+	styleName   = "Default",
+	weaponType  = "Fist",
+	comboLength = 3,   -- 2 regular hits + 1 finisher
 
 	sounds = {
-		hitId = "rbxassetid://0",
+		-- Leave as "rbxassetid://0" to use SoundUtil fallback sounds.
+		hitId   = "rbxassetid://0",
+		swingId = "rbxassetid://0",
 	},
 
 	attacks = {
@@ -24,11 +39,13 @@ return {
 				breaksBlock  = false,
 				selfImpulse  = 10,
 				velocity     = { forward = 12, up = 0, duration = 0.22 },
-				serverCD     = 0.52,
-				resetTimer   = 1.20,
+				-- endlag: blocks ALL actions for this long after the hitbox.
+				-- No serverCD — endlag is the only gate for regular M1s.
+				endlag       = 0.5,
+				resetTimer   = 1,
 			},
 			[2] = {
-				damage       = 8,
+				damage       = 10,
 				knockback    = 27,
 				knockUpRatio = 0.08,
 				stunTime     = 0.14,
@@ -39,11 +56,12 @@ return {
 				breaksBlock  = false,
 				selfImpulse  = 10,
 				velocity     = { forward = 12, up = 0, duration = 0.22 },
-				serverCD     = 0.52,
-				resetTimer   = 1.20,
+				endlag       = 0.67,
+				resetTimer   = 1.17,
 			},
 		},
-
+--[[
+		-- Fallback Regular (used if comboHits is absent).
 		Regular = {
 			damage       = 15,
 			knockback    = 26,
@@ -52,13 +70,14 @@ return {
 			hitboxSize   = Vector3.new(5, 5, 5),
 			hitboxFwd    = -3.5,
 			hitWindow    = 0.12,
-			windupWait   = 0.,
+			windupWait   = 0.22,
 			breaksBlock  = false,
 			selfImpulse  = 10,
-			velocity     = { forward = 12, up = 0, duration = 0.33 },
-			serverCD     = 0.52,
-		},
+			velocity     = { forward = 12, up = 0, duration = 0.22 },
+			endlag       = 0.18,
+		},]]
 
+		-- Finisher: has serverCD (prevents spamming the flourish).
 		Last = {
 			damage            = 16,
 			knockback         = 55,
@@ -74,10 +93,14 @@ return {
 			ragdollDuration   = 1,
 			canSoftKnockdown  = false,
 			knockdownDuration = 2.2,
-			velocity          = { forward = 24, up = 3, duration = 0.1 },
-			serverCD          = 2,
+			velocity          = { forward = 24, up = 3, duration = 0.10 },
+			-- serverCD: reuse cooldown for the flourish itself.
+			-- endlag: blocks ALL actions after the flourish lands.
+			serverCD          = 1.20,
+			endlag            = 0.80,
 		},
 
+		-- Heavy: has serverCD (prevents spamming heavy).
 		Heavy = {
 			damage       = 32,
 			knockback    = 65,
