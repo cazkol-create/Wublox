@@ -42,6 +42,6 @@ CombatConfig.EVASIVE_DASH_CD      = 15.0
 -- ── Jump cooldown ─────────────────────────────────────────────
 -- Enforced client-side in MovementClient.lua (keep both in sync).
 -- Prevents bunny-hopping and gives jumps a deliberate, weighty feel.
-CombatConfig.JUMP_COOLDOWN        = 0.5   -- seconds between consecutive jumps
+CombatConfig.JUMP_COOLDOWN        = 1.5   -- seconds between consecutive jumps
 
 return CombatConfig
