@@ -5,35 +5,25 @@
 --  Location: ServerScriptService/Modules/MovementUtil
 --
 --  CHANGES:
---    ApplyVelocity   — velocity is now attachment-relative (local
---                      space) rather than world-space.  Velocity
---                      follows the character's facing direction even
---                      if it rotates mid-attack.
---    NormalDash      — forward dash for Shift key.  Configurable
---                      force, duration, and cooldown in CONFIG.
---    EVASIVE_DASH_CD — updated to 15 seconds (was 6).
---    NORMAL_DASH_CD  — 3 seconds.
+--    • NormalDash now accepts a `direction` parameter
+--      ("forward" | "back" | "left" | "right").
+--      Sent by MovementClient based on held WASD keys.
+--
+--    • NORMAL_DASH_CD, EVASIVE_DASH_CD, NORMAL_SPEED,
+--      NORMAL_DASH_FORCE, NORMAL_DASH_DURATION, EVASIVE_DASH_FORCE
+--      are now read from CombatConfig so there is a single source.
+--
+--    • All velocity (ApplyVelocity, dashes) still uses
+--      attachment-relative LinearVelocity (RelativeTo = Attachment0).
 -- ============================================================
 
-local Players     = game:GetService("Players")
-local Debris      = game:GetService("Debris")
-local RS          = game:GetService("ReplicatedStorage")
+local Players  = game:GetService("Players")
+local Debris   = game:GetService("Debris")
+local RS       = game:GetService("ReplicatedStorage")
 
--- ── Developer config ──────────────────────────────────────────
-local CONFIG = {
-	NORMAL_SPEED       = 16,
+local CombatConfig = require(script.Parent.CombatConfig)
 
-	-- Normal dash (Shift key)
-	NORMAL_DASH_FORCE    = 65,     -- LinearVelocity magnitude
-	NORMAL_DASH_DURATION = 0.35,   -- seconds the dash velocity lasts
-	NORMAL_DASH_CD       = 3.0,    -- seconds cooldown
-
-	-- Evasive dash (E key, from SoftKnockdown)
-	EVASIVE_DASH_FORCE   = 50,
-	EVASIVE_DASH_CD      = 15.0,   -- seconds cooldown (was 6)
-}
-
--- Lazy module refs to avoid circular requires
+-- Lazy-loaded to avoid circular requires
 local StatusEffectUtil, KnockdownUtil, CombatState
 local function mods()
 	if not CombatState then
@@ -52,15 +42,7 @@ local MovementUtil = {}
 --   forward  : studs/s along the character's look direction
 --   up       : studs/s upward
 --   duration : seconds the LinearVelocity constraint is active
---   timing   : "start" (default) | "hit"  — caller decides when to call
---
--- Using RelativeTo = Attachment0 means VectorVelocity is expressed
--- in the attachment's local space.  The attachment has the same
--- orientation as HumanoidRootPart, so:
---   local X = character Right
---   local Y = character Up
---   local Z = character Backward  (Roblox -Z = LookVector)
--- To push "forward" we therefore use  Z = -(forward).
+--   timing   : "start" (default) | "hit" — caller decides when to invoke
 -- ============================================================
 function MovementUtil.ApplyVelocity(root, velocityDef)
 	if not velocityDef then return end
@@ -72,53 +54,64 @@ function MovementUtil.ApplyVelocity(root, velocityDef)
 
 	if math.abs(fwd) < 0.001 and math.abs(up) < 0.001 then return end
 
-	local att = Instance.new("Attachment")
-	att.Parent = root   -- identity CFrame → matches HRP orientation
+	local att = Instance.new("Attachment"); att.Parent = root
 
 	local lv = Instance.new("LinearVelocity")
-	lv.Attachment0           = att
-	lv.VelocityConstraintMode= Enum.VelocityConstraintMode.Vector
-	lv.RelativeTo            = Enum.ActuatorRelativeTo.Attachment0  -- KEY: local space
-	lv.MaxForce              = 9e4
-	-- In attachment local space: -Z is forward, +Y is up
-	lv.VectorVelocity        = Vector3.new(0, up, -fwd)
-	lv.Parent                = root
+	lv.Attachment0            = att
+	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	lv.RelativeTo             = Enum.ActuatorRelativeTo.Attachment0
+	lv.MaxForce               = 9e4
+	-- attachment-local space: -Z = forward, +Y = up
+	lv.VectorVelocity         = Vector3.new(0, up, -fwd)
+	lv.Parent                 = root
 
 	Debris:AddItem(lv,  dur)
 	Debris:AddItem(att, dur)
 end
 
 -- ============================================================
--- 2.  NormalDash  — called by CombatServer on action="NormalDash"
+-- 2.  NormalDash  — called when action="NormalDash"
+--     direction: "forward" | "back" | "left" | "right"
+--     Falls back to "forward" if direction is absent or unrecognised.
 -- ============================================================
-function MovementUtil.NormalDash(player, character)
-	mods()
+-- Velocity vectors in attachment-local space:
+--   forward → -Z, back → +Z, left → -X, right → +X
+local DASH_VECTORS = {
+	forward = Vector3.new( 0,  0, -1),
+	back    = Vector3.new( 0,  0,  1),
+	left    = Vector3.new(-1,  0,  0),
+	right   = Vector3.new( 1,  0,  0),
+}
 
+function MovementUtil.NormalDash(player, character, direction)
+	mods()
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if not root then return end
 
 	-- Stamp cooldown
 	local state = CombatState.Get(player)
-	state.normalDashCooldownUntil = os.clock() + CONFIG.NORMAL_DASH_CD
+	state.normalDashCooldownUntil = os.clock() + CombatConfig.NORMAL_DASH_CD
 
-	-- Forward dash using attachment-relative LinearVelocity
-	local att = Instance.new("Attachment")
-	att.Parent = root
+	local dir = DASH_VECTORS[direction or "forward"] or DASH_VECTORS.forward
+	local vel = dir * CombatConfig.NORMAL_DASH_FORCE
 
-	local lv = Instance.new("LinearVelocity")
+	local att = Instance.new("Attachment"); att.Parent = root
+	local lv  = Instance.new("LinearVelocity")
 	lv.Attachment0            = att
 	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
 	lv.RelativeTo             = Enum.ActuatorRelativeTo.Attachment0
 	lv.MaxForce               = 1.4e5
-	lv.VectorVelocity         = Vector3.new(0, 0, -CONFIG.NORMAL_DASH_FORCE)
+	lv.VectorVelocity         = vel
 	lv.Parent                 = root
 
-	Debris:AddItem(lv,  CONFIG.NORMAL_DASH_DURATION)
-	Debris:AddItem(att, CONFIG.NORMAL_DASH_DURATION)
+	Debris:AddItem(lv,  CombatConfig.NORMAL_DASH_DURATION)
+	Debris:AddItem(att, CombatConfig.NORMAL_DASH_DURATION)
 
-	-- Notify client: play dash VFX/anim
+	-- Notify client: play dash animation (direction included for anims)
 	local charFB = RS:FindFirstChild("CharacterFeedback")
-	if charFB then charFB:FireClient(player, { type = "NormalDash" }) end
+	if charFB then
+		charFB:FireClient(player, { type = "NormalDash", direction = direction or "forward" })
+	end
 end
 
 -- ============================================================
@@ -126,7 +119,6 @@ end
 -- ============================================================
 function MovementUtil.DashAttack(attackerPlayer, dashDef, style, helpers)
 	mods()
-
 	local char = attackerPlayer.Character; if not char then return end
 	local root = char:FindFirstChild("HumanoidRootPart"); if not root then return end
 	local hum  = char:FindFirstChildOfClass("Humanoid")
@@ -150,18 +142,15 @@ function MovementUtil.DashAttack(attackerPlayer, dashDef, style, helpers)
 		if not active then return end
 		active = false
 		lv:Destroy(); att:Destroy()
-		if hum and hum.Parent then hum.WalkSpeed = CONFIG.NORMAL_SPEED end
+		if hum and hum.Parent then hum.WalkSpeed = CombatConfig.NORMAL_SPEED end
 	end
 
 	local function fireStrike()
 		if not char.Parent then return end
 		if StatusEffectUtil.BlocksAttack(char) then return end
-		local hits = helpers.castHitbox(char, dashDef, attackerPlayer)
-		for _, targetChar in ipairs(hits) do
-			local targetHum  = targetChar:FindFirstChildOfClass("Humanoid")
-			if not targetHum or targetHum.Health <= 0 then continue end
+		local hits = helpers.castHitbox(char, dashDef, attackerPlayer, function(targetChar, targetHum)
 			local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
-			if not targetRoot then continue end
+			if not targetRoot then return end
 			local fwd   = root.CFrame.LookVector
 			local kbDir = (fwd + Vector3.new(0, dashDef.knockUpRatio or 0.1, 0)).Unit
 			targetHum:TakeDamage(dashDef.damage or 30)
@@ -177,12 +166,12 @@ function MovementUtil.DashAttack(attackerPlayer, dashDef, style, helpers)
 			elseif dashDef.canHardKnockdown then
 				helpers.applyKnockdown(targetChar, "hard", dashDef.knockdownDuration)
 			end
-		end
+		end)
 	end
 
-	local STEP      = 0.05
-	local maxDur    = dashDef.dashDuration or 0.9
-	local minStrike = dashDef.strikeDelay  or 0.3
+	local STEP     = 0.05
+	local maxDur   = dashDef.dashDuration or 0.9
+	local minStrike= dashDef.strikeDelay  or 0.3
 
 	while active and elapsed < maxDur do
 		task.wait(STEP); elapsed += STEP
@@ -192,36 +181,33 @@ function MovementUtil.DashAttack(attackerPlayer, dashDef, style, helpers)
 			local testHits = helpers.castHitbox(char, {
 				hitboxSize = dashDef.hitboxSize or Vector3.new(4,4,4),
 				hitboxFwd  = dashDef.hitboxFwd  or -3,
-			}, attackerPlayer)
-			if #testHits > 0 then
+			}, attackerPlayer, function() end)
+			if testHits and #testHits > 0 then
 				hitFired = true; stopDash(); fireStrike(); return
 			end
 		end
 	end
 
-	if not hitFired then hitFired = true; stopDash(); fireStrike() end
+	if not hitFired then stopDash(); fireStrike() end
 end
 
 -- ============================================================
--- 4.  EvasiveDash  — cancels SoftKnockdown (15s CD)
+-- 4.  EvasiveDash  — cancels SoftKnockdown
 -- ============================================================
 function MovementUtil.EvasiveDash(player, character)
 	mods()
-
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if not root then return end
 
 	KnockdownUtil.CancelSoftKnockdown(character)
 
-	-- Backward roll impulse (world-space; instant = no rotation issue)
+	-- Backwards roll impulse (world-space — no rotation issue since it's instantaneous)
 	local backDir = -root.CFrame.LookVector + Vector3.new(0, 0.15, 0)
-	root:ApplyImpulse(backDir.Unit * CONFIG.EVASIVE_DASH_FORCE * root.AssemblyMass)
+	root:ApplyImpulse(backDir.Unit * CombatConfig.EVASIVE_DASH_FORCE * root.AssemblyMass)
 
-	-- Stamp cooldown
 	local state = CombatState.Get(player)
-	state.evasiveDashCooldownUntil = os.clock() + CONFIG.EVASIVE_DASH_CD
+	state.evasiveDashCooldownUntil = os.clock() + CombatConfig.EVASIVE_DASH_CD
 
-	-- Notify client
 	local charFB = RS:FindFirstChild("CharacterFeedback")
 	if charFB then charFB:FireClient(player, { type = "EvasiveDash" }) end
 end
