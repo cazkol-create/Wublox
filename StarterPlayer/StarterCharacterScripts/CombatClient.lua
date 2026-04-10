@@ -3,21 +3,26 @@
 -- ============================================================
 --  CombatClient.lua  |  LocalScript  (StarterCharacterScripts)
 --
---  PIPELINE: Client input → Server logic → Client output (visuals)
+--  FIXES applied in this version:
 --
---  This script handles:
---    • Sending player combat inputs to the server (M1, Heavy, Block)
---    • Receiving server-authorised cosmetic events via CombatFX
---      (UnreliableRemoteEvent) and playing animations/sounds/VFX
---    • Receiving gameplay-critical events via CombatFeedback
---      (reliable RemoteEvent) for state changes
+--  1. BLOCKING FIX
+--     charState was permanently stuck at "Attacking" after the first
+--     attack because playAttackTrack() never reset it.  Now each attack
+--     track registers a Stopped callback that resets charState → "Idle"
+--     (with a guard so only the CURRENT active track triggers the reset,
+--     preventing mid-combo false resets when the old track is stopped by
+--     the next attack's Play() call).
 --
---  What this script does NOT do:
---    • Track combo counters (server owns combos in CombatState)
---    • Track cooldown timers (server enforces via serverCD)
---    • Decide which animation track to play (server tells us via CombatFX)
---
---  Sprint/Dash/ShiftLock are handled in MovementClient.lua
+--  2. MOVEMENT ANIMATIONS  (RS/Animations/Movement/)
+--     A dedicated movement animation table (movementAnims) is loaded from
+--     RS/Animations/Movement/ on character spawn.
+--     Expected animation names in that folder:
+--       Dash_Forward, Dash_Back, Dash_Left, Dash_Right — directional dashes
+--       EvasiveDash   — evasive roll out of SoftKnockdown
+--     EvasiveDash falls back to the legacy Shared/EvasiveDash_Roll if the
+--     Movement folder or the animation is missing.
+--     Dash anims are played in the "Movement" AnimationHandler group so
+--     they don't interfere with the "Attack" group.
 -- ============================================================
 
 local CAS     = game:GetService("ContextActionService")
@@ -36,11 +41,9 @@ local CombatVFXConfig  = require(RS.Modules.CombatVFXConfig)
 local HitboxVisualizer = require(RS.Modules.HitboxVisualizer)
 local CombatData       = require(RS.Modules.CombatData)
 
--- Reliable: gameplay-critical
 local Combat            = RS:WaitForChild("Combat")
 local CombatFeedback    = RS:WaitForChild("CombatFeedback")
 local CharacterFeedback = RS:WaitForChild("CharacterFeedback", 10)
--- Unreliable: cosmetic output (animations, sounds, VFX)
 local CombatFX          = RS:WaitForChild("CombatFX", 10)
 
 local swingSound       = script:FindFirstChild("Swing")
@@ -52,17 +55,12 @@ local sharedAnimFolder = animRoot and animRoot:FindFirstChild("Shared")
 -- DEVELOPER CONFIG
 -- ============================================================
 local CONFIG = {
-	-- Show debug hitbox visualizer (requires server DebugMode enabled)
 	SHOW_DEBUG_HITBOXES = true,
-
-	-- Hold M1 to continue combo chaining.
-	-- When true: holding LMB queues the next M1 each time the server
-	-- confirms an attack via CombatFX "PlayAttackAnim".
-	HOLD_M1_ENABLED = true,
+	HOLD_M1_ENABLED     = true,
 }
 
 -- ============================================================
--- ANIMATION HANDLER
+-- ANIMATION HANDLER  — combat tracks
 -- ============================================================
 local anim   = AnimationHandler.new(animator)
 local tracks = {}  -- [name] = AnimationTrack
@@ -114,12 +112,38 @@ end
 watchStyleValues()
 
 -- ============================================================
--- CHARACTER STATE  (UI/anim only — no cooldown tracking)
+-- MOVEMENT ANIMATIONS  (RS/Animations/Movement/)
+-- ============================================================
+local movementAnims      = {}   -- [animName] = AnimationTrack
+local movementAnimFolder = nil
+
+local function loadMovementAnims()
+	if not animRoot then return end
+	movementAnimFolder = animRoot:FindFirstChild("Movement")
+	if not movementAnimFolder then
+		warn("[CombatClient] RS/Animations/Movement/ not found — movement anims disabled")
+		return
+	end
+	-- Destroy old tracks before reloading.
+	for _, t in pairs(movementAnims) do pcall(t.Destroy, t) end
+	movementAnims = {}
+	for _, child in ipairs(movementAnimFolder:GetChildren()) do
+		if child:IsA("Animation") then
+			local ok, t = pcall(function() return animator:LoadAnimation(child) end)
+			if ok and t then
+				movementAnims[child.Name] = t
+			end
+		end
+	end
+end
+loadMovementAnims()
+
+-- ============================================================
+-- CHARACTER STATE
 -- ============================================================
 local charState  = "Idle"
 local equipping  = false
 local isBlocking = false
---local m1ButtonHeld = false   -- for hold-M1 chain
 
 local function ensureIdle()
 	if tracks["Idle"] and not anim:IsPlaying("Idle") then
@@ -135,7 +159,7 @@ local function isKnockedDown()     return isSoftKnockedDown() or isHardKnockedDo
 local function isBlocked()         return isStunned() or isKnockedDown() or charState=="Ragdolled" end
 
 -- ============================================================
--- VFX MARKER BINDING  (animation → VFX sync)
+-- VFX MARKER BINDING
 -- ============================================================
 local function getHRP() return character:FindFirstChild("HumanoidRootPart") end
 
@@ -158,10 +182,15 @@ local function bindTrackMarkers(track, wt, sn)
 	end)
 end
 
+-- ── FIX #1: playAttackTrack with charState reset on Stopped ──
+-- The capturedTrack guard ensures only the CURRENTLY active attack
+-- track (anim:GetTrack("Attack") == capturedTrack) resets the state.
+-- When a new attack plays, the old track is stopped and its Stopped
+-- fires — but anim:GetTrack("Attack") now returns the NEW track, so
+-- the guard blocks the premature reset.
 local function playAttackTrack(trackName)
 	local track = tracks[trackName]
 	if not track then
-		-- Fallback: M4 → M3, unknown finisher → M3
 		local fallbacks = { M4="M3" }
 		track = tracks[fallbacks[trackName] or "M1"]
 	end
@@ -169,11 +198,22 @@ local function playAttackTrack(trackName)
 	anim:Play("Attack", track, 0.05)
 	local wt, sn = getCurrentWeaponStyle()
 	bindTrackMarkers(track, wt, sn)
+
+	-- Reset charState when this specific animation finishes.
+	-- This re-enables blocking / parry for the player between attacks.
+	local capturedTrack = track
+	track.Stopped:Once(function()
+		if charState == "Attacking" and anim:GetTrack("Attack") == capturedTrack then
+			charState = "Idle"
+			ensureIdle()
+		end
+	end)
+
 	return track
 end
 
 -- ============================================================
--- SWING SOUND  (played only after server confirms via CombatFX)
+-- SWING SOUND  (client-side fallback; main sound now server-side)
 -- ============================================================
 local rng = Random.new()
 local function playSwingSound()
@@ -197,13 +237,13 @@ local function playSwingSound()
 end
 
 -- ============================================================
--- DRAWING ANIMATION  ("Drawing" preferred, "Equip" fallback)
+-- DRAWING ANIMATION
 -- ============================================================
 local function onToolEquipped()
 	if equipping then return end
 	equipping=true; charState="Attacking"
 	anim:Stop("Attack", 0)
-	task.wait(0)  -- one frame for WeaponType replication
+	task.wait(0)
 
 	local wt = player:FindFirstChild("Plr_WeaponType")
 	local sn = player:FindFirstChild("Plr_StyleName")
@@ -229,7 +269,7 @@ local function onToolEquipped()
 end
 
 local function onToolRemoved()
-	anim:Stop("Idle", 0.3)   -- stop idle when weapon sheathed
+	anim:Stop("Idle", 0.3)
 end
 
 character.ChildAdded:Connect(function(child)
@@ -246,10 +286,10 @@ character.ChildAdded:Connect(function(child)
 	local n = child.Name
 	if n=="Stunned" or n=="SoftKnockdown" or n=="HardKnockdown" then
 		anim:StopAll(0.1)
-		isBlocking=false; equipping=false; --m1ButtonHeld=false
+		isBlocking=false; equipping=false
 		charState="Idle"; ensureIdle()
 	elseif n=="Ragdolled" then
-		charState="Ragdolled"; anim:StopAll(0.1); --m1ButtonHeld=false
+		charState="Ragdolled"; anim:StopAll(0.1)
 	end
 end)
 character.ChildRemoved:Connect(function(child)
@@ -272,15 +312,12 @@ local activeBinds = {
 }
 
 -- ============================================================
--- INPUT HANDLERS  (send to server; server will respond via CombatFX)
--- No cooldown checks — server is authoritative.
+-- INPUT HANDLERS
 -- ============================================================
-
 local function handleM1(_, state, _)
-	if state == Enum.UserInputState.Begin then  return Enum.ContextActionResult.Pass end
+	if state == Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
 	if equipping or not hasWeapon() then return Enum.ContextActionResult.Sink end
 	if isBlocked() or isBlocking    then return Enum.ContextActionResult.Sink end
-	-- Send to server; server validates and responds with PlayAttackAnim
 	Combat:FireServer({action="M1"})
 	return Enum.ContextActionResult.Sink
 end
@@ -297,6 +334,8 @@ local function handleBlock(_, state, _)
 	if state == Enum.UserInputState.Begin then
 		if equipping or not hasWeapon()   then return Enum.ContextActionResult.Sink end
 		if isBlocked() or isBlocking      then return Enum.ContextActionResult.Sink end
+		-- FIX #1: charState now resets to "Idle" after each attack animation ends,
+		-- so this check no longer permanently blocks blocking after the first attack.
 		if charState == "Attacking"       then return Enum.ContextActionResult.Sink end
 		isBlocking=true; charState="Blocking"
 		if tracks.Block then anim:Play("Block", tracks.Block) end
@@ -318,7 +357,7 @@ for name, keys in pairs(activeBinds) do
 end
 
 -- ============================================================
--- SHARED ANIMATION HELPER
+-- SHARED ANIMATION HELPER  (Shared/ folder)
 -- ============================================================
 local function playSharedAnim(animName)
 	if not sharedAnimFolder then return end
@@ -346,51 +385,34 @@ local function playFeedbackVFX(eventType, worldPos)
 end
 
 -- ============================================================
--- COMBATFX HANDLER  (UnreliableRemoteEvent → cosmetic output)
--- All visual/audio flare lives here.
+-- COMBATFX HANDLER  (UnreliableRemoteEvent)
 -- ============================================================
 if CombatFX then
 	CombatFX.OnClientEvent:Connect(function(data)
 		if not data then return end
 
-		-- ── Server confirmed our attack; play animation + sound ──
 		if data.type == "PlayAttackAnim" then
 			charState = "Attacking"
 			playAttackTrack(data.track)
-
-			-- Sound plays AFTER server validates (not on client keypress)
 			if data.soundType == "swing" then
 				playSwingSound()
 			end
---[[
-			-- Hold-M1: if button still held, queue next press
-			if CONFIG.HOLD_M1_ENABLED and m1ButtonHeld then
-				task.wait()   -- one frame before next fire
-				if m1ButtonHeld and hasWeapon() and not isBlocked() and not isBlocking then
-					Combat:FireServer({action="M1"})
-				end
-			end]]
 
-			-- ── Debug hitbox visualizer ──────────────────────────────
 		elseif data.type == "DebugHitbox" then
 			if CONFIG.SHOW_DEBUG_HITBOXES then
 				HitboxVisualizer.Render(data)
 			end
 
-			-- ── Hit landed on a target we attacked ──────────────────
 		elseif data.type == "HitConnected" then
 			playFeedbackVFX("HitConnected", data.pos)
 
-			-- ── We were hit ──────────────────────────────────────────
 		elseif data.type == "YouWereHit" then
 			charState = "Idle"
 			playFeedbackVFX("YouWereHit", nil)
 
-			-- ── Block absorbed a hit ─────────────────────────────────
 		elseif data.type == "BlockHit" then
 			playFeedbackVFX("BlockHit", data.pos)
 
-			-- ── Our attack was parried ───────────────────────────────
 		elseif data.type == "ParriedByOpponent" then
 			playFeedbackVFX("ParriedByOpponent", nil)
 		end
@@ -398,7 +420,7 @@ if CombatFX then
 end
 
 -- ============================================================
--- COMBATFEEDBACK HANDLER  (ReliableRemoteEvent → gameplay events)
+-- COMBATFEEDBACK HANDLER  (reliable)
 -- ============================================================
 CombatFeedback.OnClientEvent:Connect(function(data)
 	if not data then return end
@@ -408,7 +430,6 @@ CombatFeedback.OnClientEvent:Connect(function(data)
 		playFeedbackVFX("ParrySuccess", data.pos)
 
 	elseif data.type == "GuardBroken" then
-		-- Must reliably stop blocking (gameplay-critical)
 		if isBlocking then
 			isBlocking=false; charState="Idle"
 			anim:Stop("Block", 0.1); ensureIdle()
@@ -426,17 +447,43 @@ end)
 if CharacterFeedback then
 	CharacterFeedback.OnClientEvent:Connect(function(data)
 		if not data then return end
+
 		if data.type == "PlayAnimation" then
 			local parts={}
 			for p in data.animPath:gmatch("[^/]+") do table.insert(parts,p) end
 			if parts[1]=="Shared" then playSharedAnim(parts[2]) end
+
+			-- ── FIX #2: EvasiveDash — uses Movement/ folder ──────
 		elseif data.type == "EvasiveDash" then
 			anim:StopAll(0.1); charState="Idle"
-			playSharedAnim("EvasiveDash_Roll"); ensureIdle()
+			-- Prefer RS/Animations/Movement/EvasiveDash, fall back to Shared.
+			local evasiveTrack = movementAnims["EvasiveDash"] or movementAnims["EvasiveDash_Roll"]
+			if evasiveTrack then
+				anim:Play("Movement", evasiveTrack, 0.05)
+				evasiveTrack.Stopped:Once(function()
+					if charState ~= "Ragdolled" then ensureIdle() end
+				end)
+			else
+				playSharedAnim("EvasiveDash_Roll")
+			end
+			ensureIdle()
+
+			-- ── FIX #2: NormalDash — uses Movement/ folder ───────
+			-- Server sends data.direction ("forward"|"back"|"left"|"right").
+			-- Animation name convention: Dash_Forward, Dash_Back, etc.
 		elseif data.type == "NormalDash" then
-			-- Play dash animation if available
-			local dashTrack = tracks["Dash"] or nil
-			if dashTrack then anim:Play("Attack", dashTrack, 0.05) end
+			local dir = data.direction or "forward"
+			local key = "Dash_" .. dir:sub(1,1):upper() .. dir:sub(2)   -- e.g. "Dash_Forward"
+			local dashTrack = movementAnims[key] or movementAnims["Dash_Forward"]
+			if dashTrack then
+				anim:Play("Movement", dashTrack, 0.1)
+				dashTrack.Stopped:Once(function()
+					if charState ~= "Ragdolled" then ensureIdle() end
+				end)
+			end
+
+		elseif data.type == "EndlagStart" then
+			-- Handled by MovementClient — nothing to do here visually.
 		end
 	end)
 end
