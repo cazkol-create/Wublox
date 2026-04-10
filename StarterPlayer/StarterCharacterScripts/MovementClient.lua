@@ -4,13 +4,16 @@
 --  MovementClient.lua  |  LocalScript
 --  Location: StarterCharacterScripts
 --
---  Handles all movement-related client logic:
---    Sprint     — double-tap W; stops on CC, no movement, or W release
---    Normal Dash— Shift key; sends to server; 3s cooldown (server enforced)
---    Evasive Dash (get out of SoftKnockdown) — E key; 15s cooldown
---    Shift Lock — Left Alt toggle (replaces default Left Shift)
+--  CHANGES:
+--    • Directional dash — getDashDirection() reads the player's
+--      current movement input and maps it to "forward", "back",
+--      "left", or "right" relative to the character's facing.
+--      The direction is sent alongside the NormalDash action.
 --
---  All developer-tunable values live in the CONFIG table below.
+--    • Endlag tracking — listens for CharacterFeedback "EndlagStart"
+--      events fired by CombatServer after attack hitboxes resolve.
+--      While in endlag, dashing is blocked locally (matches the
+--      server-side block already in Combat.OnServerEvent).
 -- ============================================================
 
 local Players       = game:GetService("Players")
@@ -22,53 +25,45 @@ local RS            = game:GetService("ReplicatedStorage")
 local player    = Players.LocalPlayer
 local character = script.Parent
 local humanoid  = character:WaitForChild("Humanoid")
-local mouse = player:GetMouse()
+local mouse     = player:GetMouse()
 
--- Wait for remotes
-local Combat = RS:WaitForChild("Combat")
+local Combat            = RS:WaitForChild("Combat")
 local CharacterFeedback = RS:WaitForChild("CharacterFeedback", 10)
 
 -- ============================================================
--- DEVELOPER CONFIG  — change these freely
+-- DEVELOPER CONFIG
 -- ============================================================
 local CONFIG = {
-	-- ── Speeds ─────────────────────────────────────────────────
-	NORMAL_SPEED = 16,
-	SPRINT_SPEED = 26,
+	NORMAL_SPEED          = 16,
+	SPRINT_SPEED          = 26,
+	W_DOUBLE_TAP_WINDOW   = 0.30,
+	MOVE_STOP_THRESHOLD   = 0.05,
 
-	-- ── Sprint trigger ─────────────────────────────────────────
-	-- Double-tap W within this window (seconds) to start sprinting.
-	W_DOUBLE_TAP_WINDOW = 0.30,
-	-- MoveDirection magnitude below this → consider stopped → stop sprint.
-	MOVE_STOP_THRESHOLD = 0.05,
+	DASH_KEYBIND          = Enum.KeyCode.LeftShift,
+	DASH_COOLDOWN         = 3.0,    -- client visual; server enforces actual CD
+	AUTO_SPRINT_AFTER_DASH= true,
 
-	-- ── Normal dash ────────────────────────────────────────────
-	DASH_KEYBIND  = Enum.KeyCode.LeftShift,
-	DASH_COOLDOWN = 3.0,   -- seconds (visual; server enforces actual CD)
-
-	-- Automatically sprint after a normal dash.
-	-- Set to false if unsure — can be changed any time.
-	AUTO_SPRINT_AFTER_DASH = true,
-
-	-- ── Evasive dash ───────────────────────────────────────────
 	EVASIVE_DASH_KEYBIND  = Enum.KeyCode.E,
-	EVASIVE_DASH_COOLDOWN = 15.0,  -- seconds (visual; server enforces)
+	EVASIVE_DASH_COOLDOWN = 15.0,
 
-	-- ── Shift lock ─────────────────────────────────────────────
-	-- Set to nil to disable the custom shift lock toggle.
-	SHIFT_LOCK_KEYBIND = Enum.KeyCode.LeftAlt,
-	SHIFT_LOCK_OFFSET = Vector3.new(2,0,0)
+	SHIFT_LOCK_KEYBIND    = Enum.KeyCode.LeftControl,
+	SHIFT_LOCK_OFFSET     = Vector3.new(2, 0, 0),
 }
 
 -- ============================================================
 -- STATE
 -- ============================================================
-local isSprinting       = false
-local dashAvailable     = true
-local evasiveAvailable  = true
-local sprintHeartbeat   = nil
+local isSprinting      = false
+local dashAvailable    = true
+local evasiveAvailable = true
+local sprintHeartbeat  = nil
+local lastWTapTime     = 0
 
-local lastWTapTime      = 0
+-- ── Endlag tracking ───────────────────────────────────────────
+-- Updated by CharacterFeedback "EndlagStart".
+-- While time() < endlagExpiry, dashing is blocked.
+local endlagExpiry = 0
+local function isInEndlag() return time() < endlagExpiry end
 
 -- ============================================================
 -- CC CHECKS
@@ -83,14 +78,11 @@ local function isCCed()            return isStunned() or isKnockedDown() or isRa
 -- ============================================================
 -- SPRINT
 -- ============================================================
-local function stopSprint(reason)
+local function stopSprint()
 	if not isSprinting then return end
 	isSprinting = false
 	humanoid.WalkSpeed = CONFIG.NORMAL_SPEED
-	if sprintHeartbeat then
-		sprintHeartbeat:Disconnect()
-		sprintHeartbeat = nil
-	end
+	if sprintHeartbeat then sprintHeartbeat:Disconnect(); sprintHeartbeat = nil end
 end
 
 local function startSprint()
@@ -99,60 +91,81 @@ local function startSprint()
 	if humanoid.MoveDirection.Magnitude < CONFIG.MOVE_STOP_THRESHOLD then return end
 	isSprinting = true
 	humanoid.WalkSpeed = CONFIG.SPRINT_SPEED
-	-- Monitor for stop conditions on every frame
 	sprintHeartbeat = RunService.Heartbeat:Connect(function()
-		if isCCed() then
-			stopSprint("cc")
-			return
-		end
-		if humanoid.MoveDirection.Magnitude < CONFIG.MOVE_STOP_THRESHOLD then
-			stopSprint("no_movement")
-		end
+		if isCCed() then stopSprint(); return end
+		if humanoid.MoveDirection.Magnitude < CONFIG.MOVE_STOP_THRESHOLD then stopSprint() end
 	end)
 end
 
--- Double-tap W detection
 UIS.InputBegan:Connect(function(input, processed)
 	if processed then return end
 	if input.KeyCode == Enum.KeyCode.W then
 		local now = time()
-		if now - lastWTapTime <= CONFIG.W_DOUBLE_TAP_WINDOW then
-			startSprint()
-		end
+		if now - lastWTapTime <= CONFIG.W_DOUBLE_TAP_WINDOW then startSprint() end
 		lastWTapTime = now
 	end
 end)
 
--- W released → stop sprint
 UIS.InputEnded:Connect(function(input)
-	if input.KeyCode == Enum.KeyCode.W then
-		stopSprint("w_released")
-	end
+	if input.KeyCode == Enum.KeyCode.W then stopSprint() end
 end)
 
--- CC → stop sprint immediately
 character.ChildAdded:Connect(function(child)
 	local n = child.Name
 	if n=="Stunned" or n=="SoftKnockdown" or n=="HardKnockdown" or n=="Ragdolled" then
-		stopSprint("cc")
+		stopSprint()
 	end
 end)
 
 -- ============================================================
--- NORMAL DASH  (Shift key → action="NormalDash")
+-- DIRECTION DETECTION
+-- Maps the player's current movement input to a dash direction
+-- relative to the character's facing direction.
+--
+-- Roblox attachment-local space: -Z = forward, +Z = back
+-- humanoid.MoveDirection is in world space.
+-- We project it into character-local space to determine intent.
+-- ============================================================
+local function getDashDirection()
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then return "forward" end
+
+	local moveDir = humanoid.MoveDirection
+	if moveDir.Magnitude < CONFIG.MOVE_STOP_THRESHOLD then
+		return "forward"   -- no directional input → forward dash
+	end
+
+	-- Project world-space move direction into local space of HRP.
+	-- localDir.X = right/left  (+ = right)
+	-- localDir.Z = backward/forward (- = forward in Roblox)
+	local localDir = root.CFrame:VectorToObjectSpace(moveDir).Unit
+	local ax, az   = math.abs(localDir.X), math.abs(localDir.Z)
+
+	if az >= ax then
+		-- Predominantly forward/back
+		return localDir.Z < 0 and "forward" or "back"
+	else
+		-- Predominantly left/right
+		return localDir.X > 0 and "right" or "left"
+	end
+end
+
+-- ============================================================
+-- NORMAL DASH
 -- ============================================================
 local function doDash()
-	if not dashAvailable then return end
-	if isCCed()           then return end
+	if isInEndlag()        then return end   -- endlag blocks dashing
+	if not dashAvailable   then return end
+	if isCCed()            then return end
 
 	dashAvailable = false
 	task.delay(CONFIG.DASH_COOLDOWN, function() dashAvailable = true end)
 
-	Combat:FireServer({ action = "NormalDash" })
+	local direction = getDashDirection()
+	Combat:FireServer({ action = "NormalDash", direction = direction })
 
-	-- Auto-sprint after dash
-	if CONFIG.AUTO_SPRINT_AFTER_DASH then
-		-- Small delay so the dash velocity finishes before sprint speed kicks in
+	-- Auto-sprint after a forward dash
+	if CONFIG.AUTO_SPRINT_AFTER_DASH and direction == "forward" then
 		task.delay(0.4, function()
 			if not isCCed() then startSprint() end
 		end)
@@ -166,7 +179,7 @@ CAS:BindAction("Movement_Dash", function(_, state, _)
 end, false, CONFIG.DASH_KEYBIND)
 
 -- ============================================================
--- EVASIVE DASH  (E key while SoftKnockdown active)
+-- EVASIVE DASH (out of SoftKnockdown)
 -- ============================================================
 local function doEvasiveDash()
 	if not evasiveAvailable   then return end
@@ -186,48 +199,42 @@ end, false, CONFIG.EVASIVE_DASH_KEYBIND)
 
 -- ============================================================
 -- SHIFT LOCK (Left Alt toggle)
--- Roblox's native shift lock is bound to Left Shift by default.
--- To use this custom shift lock:
---   1. In Studio → StarterPlayer → EnableMouseLockOption = false
---   2. This script handles the lock via RotationType.
 -- ============================================================
 if CONFIG.SHIFT_LOCK_KEYBIND then
 	local UserGameSettings = UserSettings():GetService("UserGameSettings")
-
-	-- Explicitly disable native shift lock so Left Shift doesn't interfere
-	-- (developers should also set StarterPlayer.EnableMouseLockOption = false in Studio)
 	pcall(function()
 		UserGameSettings.RotationType = Enum.RotationType.MovementRelative
 	end)
 
 	UIS.InputBegan:Connect(function(input, processed)
-		if processed then return end
-		if input.KeyCode ~= CONFIG.SHIFT_LOCK_KEYBIND then return end
-
-		local ok = pcall(function()
+		if processed or input.KeyCode ~= CONFIG.SHIFT_LOCK_KEYBIND then return end
+		pcall(function()
 			if UserGameSettings.RotationType == Enum.RotationType.CameraRelative then
 				UserGameSettings.RotationType = Enum.RotationType.MovementRelative
-				UIS.MouseBehavior = Enum.MouseBehavior.Default
-				humanoid.CameraOffset = Vector3.zero
-				mouse.Icon = ""
+				UIS.MouseBehavior             = Enum.MouseBehavior.Default
+				humanoid.CameraOffset         = Vector3.zero
+				mouse.Icon                    = ""
 			else
 				UserGameSettings.RotationType = Enum.RotationType.CameraRelative
-				UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
-				humanoid.CameraOffset = CONFIG.SHIFT_LOCK_OFFSET
-				mouse.Icon = "rbxassetid://10213989924"
+				UIS.MouseBehavior             = Enum.MouseBehavior.LockCenter
+				humanoid.CameraOffset         = CONFIG.SHIFT_LOCK_OFFSET
+				mouse.Icon                    = "rbxassetid://10213989924"
 			end
 		end)
 	end)
 end
 
 -- ============================================================
--- CHARACTER FEEDBACK reactions  (dash visual confirmation)
+-- CHARACTER FEEDBACK
+-- ── EndlagStart: block dashing for the specified duration ────
+-- Fired by CombatServer after each attack's hitbox resolves.
 -- ============================================================
 if CharacterFeedback then
 	CharacterFeedback.OnClientEvent:Connect(function(data)
 		if not data then return end
-		-- Evasive dash confirmed by server → reset local cooldown is already done above
-		-- (we used a fixed client-side timer that mirrors the server CD)
+		if data.type == "EndlagStart" and data.duration and data.duration > 0 then
+			endlagExpiry = time() + data.duration
+		end
 	end)
 end
 
@@ -235,19 +242,21 @@ end
 -- DEATH / RESPAWN
 -- ============================================================
 player.CharacterAdded:Connect(function()
-	isSprinting      = false
-	dashAvailable    = true
+	isSprinting    = false
+	dashAvailable  = true
 	evasiveAvailable = true
-	if sprintHeartbeat then sprintHeartbeat:Disconnect(); sprintHeartbeat=nil end
+	endlagExpiry   = 0
+	if sprintHeartbeat then sprintHeartbeat:Disconnect(); sprintHeartbeat = nil end
 end)
 
 -- ============================================================
--- PUBLIC API (expose to other scripts if needed)
+-- PUBLIC API
 -- ============================================================
 _G.WuxiaMovement = {
-	IsSprinting    = function() return isSprinting end,
-	StartSprint    = startSprint,
-	StopSprint     = stopSprint,
-	DashAvailable  = function() return dashAvailable end,
+	IsSprinting      = function() return isSprinting end,
+	StartSprint      = startSprint,
+	StopSprint       = stopSprint,
+	DashAvailable    = function() return dashAvailable end,
 	EvasiveAvailable = function() return evasiveAvailable end,
+	IsInEndlag       = isInEndlag,
 }
