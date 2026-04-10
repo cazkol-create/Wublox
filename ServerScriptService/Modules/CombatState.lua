@@ -1,17 +1,14 @@
 -- @ScriptType: ModuleScript
--- @ScriptType: ModuleScript
 -- ============================================================
 --  CombatState.lua  |  ModuleScript
 --  Location: ServerScriptService/Modules/CombatState
 --
 --  CHANGES:
---    • require(CombatData) replaced with require(CombatConfig).
---      All CombatData.X constants are now read from CombatConfig.
---    • normalDashCooldownUntil — stamped by MovementUtil.NormalDash.
---    • CanNormalDash() — checked by CombatServer.
+--    • slideCooldownUntil — server-side slide cooldown timestamp.
+--      Checked by CombatServer before accepting a Slide action.
 -- ============================================================
 
-local Players     = game:GetService("Players")
+local Players      = game:GetService("Players")
 local CombatConfig = require(script.Parent.CombatConfig)
 
 local CombatState = {}
@@ -32,6 +29,7 @@ local function newState()
 		activeAttackCount        = 0,
 		evasiveDashCooldownUntil = 0,
 		normalDashCooldownUntil  = 0,
+		slideCooldownUntil       = 0,   -- NEW: slide cooldown
 		endlagUntil              = 0,
 		comboCount               = 1,
 		comboResetTask           = nil,
@@ -82,7 +80,7 @@ function CombatState.CanBlock(player)
 	return os.clock() >= s.guardBrokenUntil
 end
 
--- ── Dash gates ────────────────────────────────────────────────
+-- ── Dash / slide gates ────────────────────────────────────────
 function CombatState.CanEvasiveDash(player)
 	local s = pState[player.UserId]; if not s then return true end
 	return os.clock() >= s.evasiveDashCooldownUntil
@@ -91,6 +89,11 @@ end
 function CombatState.CanNormalDash(player)
 	local s = pState[player.UserId]; if not s then return true end
 	return os.clock() >= s.normalDashCooldownUntil
+end
+
+function CombatState.CanSlide(player)
+	local s = pState[player.UserId]; if not s then return true end
+	return os.clock() >= s.slideCooldownUntil
 end
 
 -- ── Endlag ────────────────────────────────────────────────────
