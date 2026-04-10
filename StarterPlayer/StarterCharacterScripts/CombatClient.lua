@@ -119,7 +119,7 @@ watchStyleValues()
 local charState  = "Idle"
 local equipping  = false
 local isBlocking = false
-local m1ButtonHeld = false   -- for hold-M1 chain
+--local m1ButtonHeld = false   -- for hold-M1 chain
 
 local function ensureIdle()
 	if tracks["Idle"] and not anim:IsPlaying("Idle") then
@@ -142,8 +142,7 @@ local function getHRP() return character:FindFirstChild("HumanoidRootPart") end
 local function getCurrentWeaponStyle()
 	local wt = player:FindFirstChild("Plr_WeaponType")
 	local sn = player:FindFirstChild("Plr_StyleName")
-	return (wt and wt.Value ~= "") and wt.Value or "Fist",
-	(sn and sn.Value ~= "") and sn.Value or "Default"
+	return (wt and wt.Value ~= "") and wt.Value, (sn and sn.Value ~= "") and sn.Value
 end
 
 local function bindTrackMarkers(track, wt, sn)
@@ -247,10 +246,10 @@ character.ChildAdded:Connect(function(child)
 	local n = child.Name
 	if n=="Stunned" or n=="SoftKnockdown" or n=="HardKnockdown" then
 		anim:StopAll(0.1)
-		isBlocking=false; equipping=false; m1ButtonHeld=false
+		isBlocking=false; equipping=false; --m1ButtonHeld=false
 		charState="Idle"; ensureIdle()
 	elseif n=="Ragdolled" then
-		charState="Ragdolled"; anim:StopAll(0.1); m1ButtonHeld=false
+		charState="Ragdolled"; anim:StopAll(0.1); --m1ButtonHeld=false
 	end
 end)
 character.ChildRemoved:Connect(function(child)
@@ -278,16 +277,11 @@ local activeBinds = {
 -- ============================================================
 
 local function handleM1(_, state, _)
-	if state == Enum.UserInputState.Begin then
-		m1ButtonHeld = true
-		if equipping or not hasWeapon() then return Enum.ContextActionResult.Sink end
-		if isBlocked() or isBlocking    then return Enum.ContextActionResult.Sink end
-		-- Send to server; server validates and responds with PlayAttackAnim
-		Combat:FireServer({action="M1"})
-
-	elseif state == Enum.UserInputState.End then
-		m1ButtonHeld = false
-	end
+	if state == Enum.UserInputState.Begin then  return Enum.ContextActionResult.Pass end
+	if equipping or not hasWeapon() then return Enum.ContextActionResult.Sink end
+	if isBlocked() or isBlocking    then return Enum.ContextActionResult.Sink end
+	-- Send to server; server validates and responds with PlayAttackAnim
+	Combat:FireServer({action="M1"})
 	return Enum.ContextActionResult.Sink
 end
 
@@ -368,14 +362,14 @@ if CombatFX then
 			if data.soundType == "swing" then
 				playSwingSound()
 			end
-
+--[[
 			-- Hold-M1: if button still held, queue next press
 			if CONFIG.HOLD_M1_ENABLED and m1ButtonHeld then
 				task.wait()   -- one frame before next fire
 				if m1ButtonHeld and hasWeapon() and not isBlocked() and not isBlocking then
 					Combat:FireServer({action="M1"})
 				end
-			end
+			end]]
 
 			-- ── Debug hitbox visualizer ──────────────────────────────
 		elseif data.type == "DebugHitbox" then
