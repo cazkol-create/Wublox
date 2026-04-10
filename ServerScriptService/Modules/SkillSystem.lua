@@ -11,7 +11,7 @@ local RS            = game:GetService("ReplicatedStorage")
 local SkillRegistry = require(RS.Modules.SkillRegistry)
 local RagdollUtil   = require(script.Parent.RagdollUtil)
 local KnockdownUtil = require(script.Parent.KnockdownUtil)
-local TomatoHitbox  = require(script.Parent.TomatoHitbox)
+local MuchachoHitbox = require(script.Parent.MuchachoHitbox)
 local CombatState   = require(script.Parent.CombatState)
 
 local SkillSystem = {}
@@ -67,22 +67,39 @@ end
 local function castHitboxHelper(attackerChar, def, attackerPlayer, onHitFn)
 	local root = attackerChar and attackerChar:FindFirstChild("HumanoidRootPart")
 	if not root then return end
-	local hb = TomatoHitbox.new()
-	hb.Size=def.hitboxSize or Vector3.new(5,5,5)
-	hb.CFrame=root; hb.Offset=CFrame.new(0,0,def.hitboxFwd or -4)
-	hb.FilterCharacter=attackerChar; hb.HitOnce=true; hb.Visualizer=false
-	hb.onTouch = function(humanoid)
+
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {attackerChar}
+
+	local hitbox = MuchachoHitbox.CreateHitbox()
+
+	hitbox.Size = def.hitboxSize or Vector3.new(5,5,5)
+	hitbox.CFrame = root.CFrame * CFrame.new(0,0,def.hitboxFwd or -4)
+	hitbox.OverlapParams = params
+	hitbox.Visualizer = false
+
+	hitbox.Touched:Connect(function(part, humanoid)
+		if not humanoid then return end
+
 		local targetChar = humanoid.Parent
-		if not targetChar or targetChar==attackerChar then return end
-		if humanoid.Health<=0 then return end
+		if not targetChar or targetChar == attackerChar then return end
+		if humanoid.Health <= 0 then return end
+
 		local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
 		if not targetRoot then return end
+
 		if RagdollUtil.IsRagdolled(targetChar) then return end
+
 		onHitFn(targetChar, humanoid)
-	end
-	hb:Start()
+	end)
+
+	hitbox:Start()
+
 	local hw = def.hitWindow or 0.15
-	task.delay(hw, function() hb:Stop(); hb:Destroy() end)
+	task.delay(hw, function()
+		hitbox:Stop()
+	end)
 end
 
 local function playHitAnimHelper(char)
