@@ -1,4 +1,5 @@
 -- @ScriptType: LocalScript
+-- @ScriptType: LocalScript
 -- ============================================================
 --  CombatClient.lua  |  LocalScript  (StarterCharacterScripts)
 --
