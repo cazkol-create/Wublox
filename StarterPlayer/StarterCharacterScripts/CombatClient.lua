@@ -159,7 +159,7 @@ local function getCurrentWeaponStyle()
 	local wt = player:FindFirstChild("Plr_WeaponType")
 	local sn = player:FindFirstChild("Plr_StyleName")
 	return (wt and wt.Value ~= "") and wt.Value,
-	       (sn and sn.Value ~= "") and sn.Value
+	(sn and sn.Value ~= "") and sn.Value
 end
 
 local function bindTrackMarkers(track, wt, sn)
@@ -283,9 +283,9 @@ local A_HEAVY = "Combat_Heavy"
 local A_BLOCK = "Combat_Block"
 
 local activeBinds = {
-	[A_M1]    = { Enum.UserInputType.MouseButton1 },
-	[A_HEAVY] = { Enum.KeyCode.Q },
-	[A_BLOCK] = { Enum.KeyCode.F },
+	[A_M1]    = { Enum.UserInputType.MouseButton1, Enum.KeyCode.ButtonX },
+	[A_HEAVY] = { Enum.KeyCode.Q, Enum.KeyCode.ButtonR2 },
+	[A_BLOCK] = { Enum.KeyCode.F, Enum.KeyCode.ButtonL2 },
 }
 
 -- ============================================================
