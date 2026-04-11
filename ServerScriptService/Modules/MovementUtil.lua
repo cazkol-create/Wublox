@@ -212,4 +212,42 @@ function MovementUtil.EvasiveDash(player, character)
 	if charFB then charFB:FireClient(player, { type = "EvasiveDash" }) end
 end
 
+-- ============================================================
+-- New MovementUtil.Slide Function
+-- ============================================================
+
+function MovementUtil.Slide(player, character)
+	mods()
+
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	local att = Instance.new("Attachment")
+	att.Parent = root
+
+	local lv = Instance.new("LinearVelocity")
+	lv.Attachment0 = att
+	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	lv.RelativeTo = Enum.ActuatorRelativeTo.Attachment0
+	lv.MaxForce = 1.2e5
+	lv.VectorVelocity = Vector3.new(0, 0, -50)
+	lv.Parent = root
+
+	Debris:AddItem(lv, 0.8)
+	Debris:AddItem(att, 0.8)
+
+	--[[ I-frames
+	local tag = Instance.new("BoolValue")
+	tag.Name = "IFrames"
+	tag.Parent = character
+	Debris:AddItem(tag, 0.5)
+	]]
+
+	-- Notify client
+	local charFB = RS:FindFirstChild("CharacterFeedback")
+	if charFB then
+		charFB:FireClient(player, { type = "Slide" })
+	end
+end
+
 return MovementUtil
