@@ -1,4 +1,5 @@
 -- @ScriptType: Script
+-- @ScriptType: Script
 -- ============================================================
 --  CombatServer.lua  |  Script (NOT ModuleScript)
 --  Location: ServerScriptService
