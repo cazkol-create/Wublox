@@ -233,7 +233,14 @@ local function handleAttack(attackerPlayer, def, style)
 	local attackerChar = attackerPlayer.Character; if not attackerChar then return end
 	local attackerRoot = attackerChar:FindFirstChild("HumanoidRootPart"); if not attackerRoot then return end
 	local attackerHum  = attackerChar:FindFirstChildOfClass("Humanoid")
-
+	
+	local postHitEndlag = (def.endlag and def.endlag > 0) and def.endlag
+		or CombatConfig.DEFAULT_COMBO_ENDLAG
+	CombatState.SetEndlag(attackerPlayer, postHitEndlag) -- FOR THE AI, DO NOT CHANGE THIS FSOR NOW...
+	CharacterFeedback:FireClient(attackerPlayer, {
+		type     = "EndlagStart",
+		duration = postHitEndlag,
+	})
 	-- FIX #1 (parry stun): skip WalkSpeed restore if CC'd.
 	-- StatusEffectUtil.onRemove handles restoration when Hitstun expires.
 	local function finalize()
@@ -248,7 +255,7 @@ local function handleAttack(attackerPlayer, def, style)
 	end
 
 	if attackerHum then attackerHum.WalkSpeed = CombatConfig.ATTACK_SPEED end
-
+	
 	local velDef = def.velocity
 	if velDef and (velDef.timing == "start" or velDef.timing == nil) then
 		MovementUtil.ApplyVelocity(attackerRoot, velDef)
@@ -267,13 +274,6 @@ local function handleAttack(attackerPlayer, def, style)
 
 	-- FIX #1 (combo): post-hit endlag from def or tiny fallback.
 	-- This replaces the pre-lock (set before spawn) for the inter-hit window.
-	local postHitEndlag = (def.endlag and def.endlag > 0) and def.endlag
-		or CombatConfig.DEFAULT_COMBO_ENDLAG
-	CombatState.SetEndlag(attackerPlayer, postHitEndlag)
-	CharacterFeedback:FireClient(attackerPlayer, {
-		type     = "EndlagStart",
-		duration = postHitEndlag,
-	})
 
 	local attackDir = attackerRoot.CFrame.LookVector
 
@@ -300,7 +300,7 @@ local function handleAttack(attackerPlayer, def, style)
 			CombatFeedback:FireClient(attackerPlayer, {type="ParriedByOpponent", pos=hitPos})
 			return
 
-		-- ── Block ──────────────────────────────────────────────
+				-- ── Block ──────────────────────────────────────────────
 		elseif blockState == "blocking" and not def.breaksBlock then
 			local reduced = math.max(1, math.floor(def.damage*(1-CombatConfig.BLOCK_REDUCTION)))
 			targetHum:TakeDamage(reduced)
@@ -309,7 +309,7 @@ local function handleAttack(attackerPlayer, def, style)
 			if targetPlayer then CombatFX:FireClient(targetPlayer, {type="BlockHit", pos=hitPos}) end
 			return
 
-		-- ── Guard Break ────────────────────────────────────────
+				-- ── Guard Break ────────────────────────────────────────
 		elseif blockState == "blocking" and def.breaksBlock then
 			CombatState.BreakGuard(targetChar)
 			if targetPlayer then
@@ -403,7 +403,7 @@ Combat.OnServerEvent:Connect(function(player, data)
 
 		task.spawn(handleAttack, player, def, style)
 
-	-- ── Heavy ─────────────────────────────────────────────────
+		-- ── Heavy ─────────────────────────────────────────────────
 	elseif data.action == "Heavy" then
 		if not getEquippedTool(character) then return end
 		local style = getPlayerStyle(player); if not style then return end
@@ -426,7 +426,7 @@ Combat.OnServerEvent:Connect(function(player, data)
 		})
 		task.spawn(handleAttack, player, def, style)
 
-	-- ── Block ─────────────────────────────────────────────────
+		-- ── Block ─────────────────────────────────────────────────
 	elseif data.action == "BlockStart" then
 		if not getEquippedTool(character) then return end
 		if not CombatState.CanBlock(player) then return end
@@ -456,27 +456,31 @@ Combat.OnServerEvent:Connect(function(player, data)
 		state.blockState = nil
 		if hum then hum.WalkSpeed = CombatConfig.NORMAL_SPEED end
 
-	-- ── Evasive Dash ──────────────────────────────────────────
+		-- ── Evasive Dash ──────────────────────────────────────────
 	elseif data.action == "EvasiveDash" then
 		if not StatusEffectUtil.CanEvasiveDash(character) then return end
 		if not CombatState.CanEvasiveDash(player) then return end
 		task.spawn(MovementUtil.EvasiveDash, player, character)
 
-	-- ── Normal Dash ───────────────────────────────────────────
+		-- ── Normal Dash ───────────────────────────────────────────
 	elseif data.action == "NormalDash" then
 		if not CombatState.CanNormalDash(player) then return end
 		task.spawn(MovementUtil.NormalDash, player, character, data.direction)
 
-	-- ── Slide (NEW) ───────────────────────────────────────────
+		-- ── Slide (NEW) ───────────────────────────────────────────
 	elseif data.action == "Slide" then
 		if StatusEffectUtil.BlocksAttack(character) then return end
 		if RagdollUtil.IsRagdolled(character) then return end
 		if not CombatState.CanSlide(player) then return end
 		-- Stamp cooldown immediately to prevent re-entry
 		state.slideCooldownUntil = now + CombatConfig.SLIDE_COOLDOWN
-		task.spawn(MovementUtil.Slide, player, character)
+		if MovementUtil.Slide then
+			task.spawn(MovementUtil.Slide, player, character)
+		else
+			warn("Slide function missing in MovementUtil")
+		end
 
-	-- ── Dash Attack ───────────────────────────────────────────
+		-- ── Dash Attack ───────────────────────────────────────────
 	elseif data.action == "DashAttack" then
 		if not getEquippedTool(character) then return end
 		if CombatState.IsAttacking(player) then return end
