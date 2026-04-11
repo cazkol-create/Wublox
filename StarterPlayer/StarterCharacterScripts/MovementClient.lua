@@ -1,4 +1,5 @@
 -- @ScriptType: LocalScript
+-- @ScriptType: LocalScript
 -- ============================================================
 --  MovementClient.lua  |  LocalScript
 --  Location: StarterCharacterScripts
