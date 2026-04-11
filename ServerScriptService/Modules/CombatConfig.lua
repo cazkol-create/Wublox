@@ -1,4 +1,5 @@
 -- @ScriptType: ModuleScript
+-- @ScriptType: ModuleScript
 -- ============================================================
 --  CombatConfig.lua  |  ModuleScript
 --  Location: ServerScriptService/Modules/CombatConfig
