@@ -65,6 +65,8 @@ end
 
 -- ── BallSocket ragdoll ────────────────────────────────────────
 local function performRagdoll(character)
+	claimOwnership(character)
+	
 	for _, v in pairs(character:GetDescendants()) do
 		if v:IsA("Motor6D") then
 			local bs  = Instance.new("BallSocketConstraint")
@@ -92,6 +94,8 @@ local function performRagdoll(character)
 end
 
 local function unRagdoll(character)
+	releaseOwnership(character)
+	
 	for _, v in pairs(character:GetDescendants()) do
 		if v:IsA("BallSocketConstraint") then
 			v:Destroy()
