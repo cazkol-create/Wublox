@@ -4,40 +4,28 @@
 --  CombatServer.lua  |  Script (NOT ModuleScript)
 --  Location: ServerScriptService
 --
---  CHANGES IN THIS VERSION:
+--  CHANGES IN THIS VERSION (Patch 2):
 --
---  1. COMBO FIX — "ghost M1" and sluggish linking resolved
---     • PlayAttackAnim is now fired via CombatFeedback (reliable
---       RemoteEvent).  Previously fired via CombatFX (unreliable),
---       packet drops caused the animation to not play while the
---       hitbox still fired — the classic "ghost M1".
---     • Pre-lock = windupWait + hitWindow + COMBO_PRELOCK_BUFFER.
---       Covers the full attack window to prevent ghost M1s during
---       windup AND hitbox phase.
---     • Post-hit endlag = def.endlag OR DEFAULT_COMBO_ENDLAG (0.10s).
---       For styles without explicit endlag (Sword Regular), the
---       0.10s fallback keeps the chain responsive.
---     • Parry stun fix retained: finalize() skips WalkSpeed restore
---       if the attacker is currently CC'd.
+--  1. COMBAT TAG INTEGRATION
+--     • CombatTag.Tag(attackerPlayer) called at the top of handleAttack.
+--     • CombatTag.Tag(targetPlayer) called after TakeDamage in the full-hit
+--       branch so the defender's regen is also paused.
 --
---  2. CLIENT-SIDE SOUNDS
---     • All SoundUtil.Play* calls replaced with SoundFX:FireAllClients.
---     • SoundFX is a new UnreliableRemoteEvent.  ClientSoundHandler
---       (StarterPlayerScripts) receives events and plays sounds locally
---       from RS/Sounds/CombatSounds/GenericCombatSounds/.
---     • Server no longer creates Sound instances — zero double-sound risk.
+--  2. RUNNING ATTACK
+--     • New "RunAttack" action received from CombatClient when player M1s
+--       while sprinting.  Uses style.attacks.runAttack def.
+--     • Does NOT touch combo counter — completely separate from M1 chain.
 --
---  3. I-FRAMES ON DASHES
---     • NormalDash and EvasiveDash tag the character with an "IFrames"
---       BoolValue for NORMAL_DASH_IFRAMES / EVASIVE_DASH_IFRAMES seconds.
---     • The hitbox onTouch callback skips any target that has "IFrames".
---     • NOTE: This check is inside the application callback, NOT inside
---       MuchachoHitbox itself — the hitbox module is untouched.
+--  3. SLIDE GROUND CHECK
+--     • Server now rejects Slide actions when the character is airborne
+--       (FloorMaterial == Air).
 --
---  4. SLIDE ACTION
---     • New "Slide" action received from MovementClient.
---     • Server validates (not CC'd, slide cooldown), then calls
---       MovementUtil.Slide which applies velocity and grants IFrames.
+--  Previous patch notes (Patch 1) retained below:
+--
+--  COMBO FIX — "ghost M1" and sluggish linking resolved
+--  CLIENT-SIDE SOUNDS — SoundFX UnreliableRemoteEvent
+--  I-FRAMES ON DASHES
+--  SLIDE ACTION
 -- ============================================================
 
 local Players    = game:GetService("Players")
@@ -45,15 +33,16 @@ local SS         = game:GetService("ServerStorage")
 local Debris     = game:GetService("Debris")
 local RS         = game:GetService("ReplicatedStorage")
 
-local CombatConfig    = require(script.Parent.Modules.CombatConfig)
-local CombatState     = require(script.Parent.Modules.CombatState)
-local RagdollUtil     = require(script.Parent.Modules.RagdollUtil)
-local StatusEffectUtil= require(script.Parent.Modules.StatusEffectUtil)
-local KnockdownUtil   = require(script.Parent.Modules.KnockdownUtil)
-local MovementUtil    = require(script.Parent.Modules.MovementUtil)
-local SkillSystem     = require(script.Parent.Modules.SkillSystem)
-local MuchachoHitbox  = require(script.Parent.Modules.MuchachoHitbox)
-local InventoryData   = require(RS.Modules.InventoryData)
+local CombatConfig     = require(script.Parent.Modules.CombatConfig)
+local CombatState      = require(script.Parent.Modules.CombatState)
+local CombatTag        = require(script.Parent.Modules.CombatTag)
+local RagdollUtil      = require(script.Parent.Modules.RagdollUtil)
+local StatusEffectUtil = require(script.Parent.Modules.StatusEffectUtil)
+local KnockdownUtil    = require(script.Parent.Modules.KnockdownUtil)
+local MovementUtil     = require(script.Parent.Modules.MovementUtil)
+local SkillSystem      = require(script.Parent.Modules.SkillSystem)
+local MuchachoHitbox   = require(script.Parent.Modules.MuchachoHitbox)
+local InventoryData    = require(RS.Modules.InventoryData)
 
 -- ── Remotes ───────────────────────────────────────────────────
 local function getOrCreate(parent, name, class)
@@ -71,7 +60,6 @@ local EquipSkillRE      = getOrCreate(RS, "EquipSkill",        "RemoteEvent")
 local UnequipSkillRE    = getOrCreate(RS, "UnequipSkill",      "RemoteEvent")
 local CharacterFeedback = getOrCreate(RS, "CharacterFeedback", "RemoteEvent")
 local CombatFX          = getOrCreate(RS, "CombatFX",          "UnreliableRemoteEvent")
--- FIX #2: Dedicated sound remote — fired to ALL clients for 3D positional audio.
 local SoundFX           = getOrCreate(RS, "SoundFX",           "UnreliableRemoteEvent")
 
 -- ============================================================
@@ -172,10 +160,7 @@ local function playHitAnim(char)
 end
 
 -- ============================================================
--- SOUND HELPER  (FIX #2)
--- All combat sounds are fired to clients as events.
--- ClientSoundHandler plays them locally for proper 3D audio
--- with zero server-side Sound creation.
+-- SOUND HELPER
 -- ============================================================
 local function fireSound(soundType, position)
 	SoundFX:FireAllClients({ type = soundType, position = position })
@@ -216,8 +201,6 @@ local function castHitbox(attackerChar, def, attackerPlayer, onHitFn)
 		local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
 		if not targetRoot then return end
 		if RagdollUtil.IsRagdolled(targetChar) then return end
-		-- FIX #3: I-frames check — skip targets that are currently invincible.
-		-- The hitbox fires normally; we just don't resolve damage.
 		if targetChar:FindFirstChild("IFrames") then return end
 		onHitFn(targetChar, humanoid)
 	end)
@@ -231,19 +214,21 @@ end
 -- CORE ATTACK HANDLER
 -- ============================================================
 local function handleAttack(attackerPlayer, def, style)
+	-- Tag attacker as in-combat; pauses their health regen
+	CombatTag.Tag(attackerPlayer)
+
 	local attackerChar = attackerPlayer.Character; if not attackerChar then return end
 	local attackerRoot = attackerChar:FindFirstChild("HumanoidRootPart"); if not attackerRoot then return end
 	local attackerHum  = attackerChar:FindFirstChildOfClass("Humanoid")
-	
+
 	local postHitEndlag = (def.endlag and def.endlag > 0) and def.endlag
 		or CombatConfig.DEFAULT_COMBO_ENDLAG
-	CombatState.SetEndlag(attackerPlayer, postHitEndlag) -- FOR THE AI, DO NOT CHANGE THIS FSOR NOW...
+	CombatState.SetEndlag(attackerPlayer, postHitEndlag)
 	CharacterFeedback:FireClient(attackerPlayer, {
 		type     = "EndlagStart",
 		duration = postHitEndlag,
 	})
-	-- FIX #1 (parry stun): skip WalkSpeed restore if CC'd.
-	-- StatusEffectUtil.onRemove handles restoration when Hitstun expires.
+
 	local function finalize()
 		local remaining = CombatState.DecrementAttackCount(attackerPlayer)
 		if remaining == 0 and attackerHum and attackerHum.Parent then
@@ -256,7 +241,7 @@ local function handleAttack(attackerPlayer, def, style)
 	end
 
 	if attackerHum then attackerHum.WalkSpeed = CombatConfig.ATTACK_SPEED end
-	
+
 	local velDef = def.velocity
 	if velDef and (velDef.timing == "start" or velDef.timing == nil) then
 		MovementUtil.ApplyVelocity(attackerRoot, velDef)
@@ -273,17 +258,13 @@ local function handleAttack(attackerPlayer, def, style)
 	if not attackerChar.Parent then finalize(); return end
 	if StatusEffectUtil.BlocksAttack(attackerChar) then finalize(); return end
 
-	-- FIX #1 (combo): post-hit endlag from def or tiny fallback.
-	-- This replaces the pre-lock (set before spawn) for the inter-hit window.
-
 	local attackDir = attackerRoot.CFrame.LookVector
 
-	-- FIX #2: fire swing sound to all clients at attacker position
 	fireSound("swing", attackerRoot.Position)
 
 	local hitWindow = castHitbox(attackerChar, def, attackerPlayer, function(targetChar, humanoid)
-		local targetHum  = humanoid
-		local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+		local targetHum    = humanoid
+		local targetRoot   = targetChar:FindFirstChild("HumanoidRootPart")
 		if not targetRoot then return end
 		local hitPos       = targetRoot.Position
 		local targetPlayer = Players:GetPlayerFromCharacter(targetChar)
@@ -320,6 +301,9 @@ local function handleAttack(attackerPlayer, def, style)
 
 		-- ── Full Hit ───────────────────────────────────────────
 		targetHum:TakeDamage(def.damage)
+		-- Tag the defender as in-combat so their regen is also paused
+		if targetPlayer then CombatTag.Tag(targetPlayer) end
+
 		local kbDir = (attackDir + Vector3.new(0, def.knockUpRatio or 0.1, 0)).Unit
 		applyImpulse(targetRoot, kbDir, def.knockback)
 		applyStun(targetChar, def.stunTime)
@@ -388,14 +372,9 @@ Combat.OnServerEvent:Connect(function(player, data)
 			CombatState.SetAttacking(player, (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + 0.05)
 		end
 
-		-- FIX #1: Pre-lock covers windupWait + hitWindow + buffer.
-		-- Prevents ghost M1s sent during the attack animation.
-		-- handleAttack OVERWRITES this with postHitEndlag when the hitbox fires.
 		local preLockDur = (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + CombatConfig.COMBO_PRELOCK_BUFFER
 		CombatState.SetEndlag(player, preLockDur)
 
-		-- FIX #1: PlayAttackAnim → reliable CombatFeedback.
-		-- Prevents dropped UnreliableRemoteEvent packets = no more ghost M1 animations.
 		CombatFeedback:FireClient(player, {
 			type      = "PlayAttackAnim",
 			track     = trackName,
@@ -424,6 +403,29 @@ Combat.OnServerEvent:Connect(function(player, data)
 			type      = "PlayAttackAnim",
 			track     = "Heavy",
 			soundType = "swing",
+		})
+		task.spawn(handleAttack, player, def, style)
+
+		-- ── Running Attack ────────────────────────────────────────
+	elseif data.action == "RunAttack" then
+		if not getEquippedTool(character) then return end
+		if CombatState.IsAttacking(player) then return end
+
+		local style = getPlayerStyle(player); if not style then return end
+		local def   = style.attacks and style.attacks.runAttack
+		if not def then return end
+
+		local serverCD = def.serverCD or 0.6
+		if now - (state.lastRunAttackTime or 0) < serverCD then return end
+		state.lastRunAttackTime = now
+
+		local preLockDur = (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + CombatConfig.COMBO_PRELOCK_BUFFER
+		CombatState.SetEndlag(player, preLockDur)
+		CombatState.SetAttacking(player, preLockDur)
+
+		CombatFeedback:FireClient(player, {
+			type  = "PlayRunAttackAnim",
+			track = "RunAttack",
 		})
 		task.spawn(handleAttack, player, def, style)
 
@@ -468,12 +470,14 @@ Combat.OnServerEvent:Connect(function(player, data)
 		if not CombatState.CanNormalDash(player) then return end
 		task.spawn(MovementUtil.NormalDash, player, character, data.direction)
 
-		-- ── Slide (NEW) ───────────────────────────────────────────
+		-- ── Slide ─────────────────────────────────────────────────
 	elseif data.action == "Slide" then
 		if StatusEffectUtil.BlocksAttack(character) then return end
 		if RagdollUtil.IsRagdolled(character) then return end
 		if not CombatState.CanSlide(player) then return end
-		-- Stamp cooldown immediately to prevent re-entry
+		-- Reject slides while airborne
+		if hum and hum.FloorMaterial == Enum.Material.Air then return end
+
 		state.slideCooldownUntil = now + CombatConfig.SLIDE_COOLDOWN
 		if MovementUtil.Slide then
 			task.spawn(MovementUtil.Slide, player, character)
@@ -508,6 +512,7 @@ end)
 UseSkill.OnServerEvent:Connect(function(player, data)
 	if typeof(data) ~= "table" or not data.skillId then return end
 	if CombatState.IsInEndlag(player) then return end
+	CombatTag.Tag(player)
 	SkillSystem.ExecuteSkill(player, data.skillId)
 end)
 
@@ -515,10 +520,10 @@ EquipSkillRE.OnServerEvent:Connect(function(player, data)
 	if typeof(data) ~= "table" or not data.skillId then return end
 	local ok, reason = SkillSystem.EquipSkill(player, data.skillId)
 	CombatFeedback:FireClient(player, {
-		type=  "SkillEquipResult",
-		skillId= data.skillId,
-		success= ok,
-		reason = reason or "",
+		type    = "SkillEquipResult",
+		skillId = data.skillId,
+		success = ok,
+		reason  = reason or "",
 	})
 end)
 
