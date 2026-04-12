@@ -1,0 +1,2 @@
+-- @ScriptType: Script
+local model = script.Parent local humanoid = model.Humanoid local respawntime = 3 local modelclone = model:Clone() modelclone.Parent = game.ReplicatedStorage humanoid.Died:Connect(function() wait(respawntime) modelclone.Parent = model.Parent model:Destroy() end)
