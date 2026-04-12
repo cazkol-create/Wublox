@@ -3,26 +3,24 @@
 -- ============================================================
 --  CombatClient.lua  |  LocalScript  (StarterCharacterScripts)
 --
---  CHANGES IN THIS VERSION:
+--  CHANGES IN THIS VERSION (Patch 2):
 --
---  1. COMBO FIX — animation restart
---     • playAttackTrack() now FORCE-STOPS the current attack
---       animation before playing the next one, even when the fallback
---       resolves to the same track (e.g. M2 → M1 for sword styles
---       that don't have M2/M3 animations).
---       Previously AnimationHandler skipped restart if same track was
---       already playing → the animation appeared "frozen" while the
---       server hitbox still fired (ghost M1 with no animation).
---     • PlayAttackAnim handling moved from CombatFX (unreliable) to
---       CombatFeedback (reliable) handler.  Dropped packets can no
---       longer cause silent hitboxes.
+--  1. RUNNING ATTACK
+--     • handleM1 checks _G.WuxiaMovement.IsSprinting() before firing.
+--       If sprinting, fires action="RunAttack" instead of "M1".
+--     • "RunAttack" track loaded alongside other combat tracks.
+--     • CombatFeedback handler responds to "PlayRunAttackAnim".
 --
---  2. MOVEMENT ANIMATIONS  (RS/Animations/Movement/)
---     • movementAnims table loaded from RS/Animations/Movement/ on spawn.
---     • Run   — played when sprinting (via _G.WuxiaMovement callback).
---     • Slide — played on CharacterFeedback "Slide" event.
---     • Dash_Forward / Dash_Back / Dash_Left / Dash_Right — directional dashes.
---     • EvasiveDash — falls back to Shared/EvasiveDash_Roll if absent.
+--  2. IMPACT MARKER SCREEN FLASH
+--     • bindTrackMarkers now additionally connects the "Impact"
+--       KeyframeMarker to a brief VFXUtil.PlayScreenEffect("impact").
+--     • The Impact world-VFX is already handled via CombatVFXConfig
+--       (BindAllMarkers picks it up automatically).
+--
+--  Previous patch notes (Patch 1) retained below:
+--
+--  COMBO FIX — animation restart
+--  MOVEMENT ANIMATIONS  (RS/Animations/Movement/)
 -- ============================================================
 
 local CAS        = game:GetService("ContextActionService")
@@ -79,12 +77,13 @@ local function reloadTracks(wt, sn)
 	local folder = loadAnimFolder(wt, sn)
 	if not folder then return end
 
-	for _, name in ipairs({"M1","M2","M3","M4","Heavy","Block","Idle","Drawing","Equip"}) do
+	-- RunAttack included in the load list
+	for _, name in ipairs({"M1","M2","M3","M4","Heavy","Block","Idle","Drawing","Equip","RunAttack"}) do
 		local animObj = folder:FindFirstChild(name)
 		if animObj then
 			local ok, t = pcall(function() return animator:LoadAnimation(animObj) end)
 			if ok then tracks[name] = t end
-		elseif name ~= "Drawing" and name ~= "Equip" and name ~= "M4" then
+		elseif name ~= "Drawing" and name ~= "Equip" and name ~= "M4" and name ~= "RunAttack" then
 			warn("[CombatClient] Missing animation:", name, "in", folder:GetFullName())
 		end
 	end
@@ -165,23 +164,29 @@ end
 
 local function bindTrackMarkers(track, wt, sn)
 	local bindings = CombatVFXConfig.GetMarkers(wt, sn)
-	if #bindings == 0 then return end
-	local bindTable = {}
-	for _, b in ipairs(bindings) do
-		table.insert(bindTable, { b.marker, b.category, b.effectName, getHRP, b.options })
+	local conns    = {}
+
+	if #bindings > 0 then
+		local bindTable = {}
+		for _, b in ipairs(bindings) do
+			table.insert(bindTable, { b.marker, b.category, b.effectName, getHRP, b.options })
+		end
+		conns = VFXUtil.BindAllMarkers(track, bindTable)
 	end
-	local conns = VFXUtil.BindAllMarkers(track, bindTable)
+
+	-- Impact screen flash — brief warm pulse at the moment the attack is about to land.
+	-- The world VFX for Impact is already wired above via CombatVFXConfig.
+	local impactConn = track:GetMarkerReachedSignal("Impact"):Connect(function()
+		VFXUtil.PlayScreenEffect("impact", 0.08)
+	end)
+	table.insert(conns, impactConn)
+
 	track.Stopped:Once(function()
 		for _, c in ipairs(conns) do c:Disconnect() end
 	end)
 end
 
--- ── FIX #1: Force-restart attack animation ───────────────────
--- Always stop the current attack track before playing the next,
--- even if the fallback resolves to the same track object.
--- Without this, AnimationHandler.Play() skips restart when
--- current == track (same track still playing from previous hit),
--- making combos appear to "freeze" with no visible animation.
+-- ── Force-restart attack animation ──────────────────────────
 local function playAttackTrack(trackName)
 	local track = tracks[trackName]
 	if not track then
@@ -190,7 +195,6 @@ local function playAttackTrack(trackName)
 	end
 	if not track then return nil end
 
-	-- Force stop current attack anim before playing (handles same-track restarts)
 	local currentAttackTrack = anim:GetTrack("Attack")
 	if currentAttackTrack and currentAttackTrack.IsPlaying then
 		currentAttackTrack:Stop(0.05)
@@ -200,9 +204,6 @@ local function playAttackTrack(trackName)
 	local wt, sn = getCurrentWeaponStyle()
 	bindTrackMarkers(track, wt, sn)
 
-	-- Reset charState when this specific animation finishes.
-	-- The capturedTrack guard prevents a stopped OLD track from resetting
-	-- state mid-combo (the new track has already replaced it in the group).
 	local capturedTrack = track
 	track.Stopped:Once(function()
 		if charState == "Attacking" and anim:GetTrack("Attack") == capturedTrack then
@@ -296,7 +297,15 @@ local function handleM1(_, state, _)
 	if state == Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
 	if equipping or not hasWeapon() then return Enum.ContextActionResult.Sink end
 	if isBlocked() or isBlocking    then return Enum.ContextActionResult.Sink end
-	Combat:FireServer({action="M1"})
+
+	-- Running attack: send a different action when sprinting
+	local isSprinting = _G.WuxiaMovement and _G.WuxiaMovement.IsSprinting and _G.WuxiaMovement.IsSprinting()
+	if isSprinting then
+		Combat:FireServer({ action = "RunAttack" })
+		return Enum.ContextActionResult.Sink
+	end
+
+	Combat:FireServer({ action = "M1" })
 	return Enum.ContextActionResult.Sink
 end
 
@@ -304,7 +313,7 @@ local function handleHeavy(_, state, _)
 	if state ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
 	if equipping or not hasWeapon() then return Enum.ContextActionResult.Sink end
 	if isBlocked() or isBlocking    then return Enum.ContextActionResult.Sink end
-	Combat:FireServer({action="Heavy"})
+	Combat:FireServer({ action = "Heavy" })
 	return Enum.ContextActionResult.Sink
 end
 
@@ -315,13 +324,13 @@ local function handleBlock(_, state, _)
 		if charState == "Attacking"       then return Enum.ContextActionResult.Sink end
 		isBlocking = true; charState = "Blocking"
 		if tracks.Block then anim:Play("Block", tracks.Block) end
-		Combat:FireServer({action="BlockStart"})
+		Combat:FireServer({ action = "BlockStart" })
 
 	elseif state == Enum.UserInputState.End then
 		if not isBlocking then return Enum.ContextActionResult.Sink end
 		isBlocking = false; charState = "Idle"
 		anim:Stop("Block", 0.15)
-		Combat:FireServer({action="BlockEnd"})
+		Combat:FireServer({ action = "BlockEnd" })
 		ensureIdle()
 	end
 	return Enum.ContextActionResult.Sink
@@ -362,8 +371,6 @@ end
 
 -- ============================================================
 -- COMBATFX HANDLER  (UnreliableRemoteEvent — cosmetic only)
--- NOTE: PlayAttackAnim has been moved to CombatFeedback (reliable).
--- Only truly cosmetic events remain here.
 -- ============================================================
 if CombatFX then
 	CombatFX.OnClientEvent:Connect(function(data)
@@ -390,15 +397,17 @@ end
 
 -- ============================================================
 -- COMBATFEEDBACK HANDLER  (reliable RemoteEvent)
--- FIX #1: PlayAttackAnim is now here to guarantee delivery.
 -- ============================================================
 CombatFeedback.OnClientEvent:Connect(function(data)
 	if not data then return end
 
-	-- FIX #1: Animation events (formerly in CombatFX unreliable)
 	if data.type == "PlayAttackAnim" then
 		charState = "Attacking"
 		playAttackTrack(data.track)
+
+	elseif data.type == "PlayRunAttackAnim" then
+		charState = "Attacking"
+		playAttackTrack("RunAttack")
 
 	elseif data.type == "ParrySuccess" then
 		if parrySound then parrySound:Play() end
@@ -442,7 +451,7 @@ if CharacterFeedback then
 
 		elseif data.type == "NormalDash" then
 			local dir = data.direction or "forward"
-			local key = "Dash_" .. dir:sub(1,1):upper() .. dir:sub(2)  -- e.g. "Dash_Forward"
+			local key = "Dash_" .. dir:sub(1,1):upper() .. dir:sub(2)
 			local t   = movementAnims[key] or movementAnims["Dash_Forward"]
 			if t then
 				anim:Play("Movement", t, 0.1)
@@ -452,10 +461,9 @@ if CharacterFeedback then
 			end
 
 		elseif data.type == "Slide" then
-			-- Server confirmed slide; play animation (MovementClient also plays it
-			-- optimistically, so this acts as a sync/refresh if needed).
 			local t = movementAnims["Slide"]
 			if t then
+				anim:StopAll(0.1)
 				anim:Stop("Movement", 0.1)
 				anim:Play("Slide", t, 0.1)
 				t.Stopped:Once(function()
@@ -471,10 +479,8 @@ end
 
 -- ============================================================
 -- SPRINT / RUN ANIMATION SYNC
--- Hooks into WuxiaMovement public API (set by MovementClient).
 -- ============================================================
 task.spawn(function()
-	-- Wait for MovementClient to set up _G.WuxiaMovement
 	local waited = 0
 	while not (_G.WuxiaMovement and _G.WuxiaMovement.OnSprintChanged) and waited < 5 do
 		task.wait(0.1); waited += 0.1
@@ -486,7 +492,6 @@ task.spawn(function()
 		if sprinting and runTrack then
 			anim:Play("Movement", runTrack, 0.2)
 		else
-			-- Only stop Movement group if we're not in a dash/slide
 			local current = anim:GetTrack("Movement")
 			if current == runTrack then
 				anim:Stop("Movement", 0.2)
@@ -499,7 +504,7 @@ end)
 -- PUBLIC API
 -- ============================================================
 _G.WuxiaClient                    = _G.WuxiaClient or {}
-_G.WuxiaClient.CombatActions      = {M1=A_M1, Heavy=A_HEAVY, Block=A_BLOCK}
+_G.WuxiaClient.CombatActions      = { M1=A_M1, Heavy=A_HEAVY, Block=A_BLOCK }
 _G.WuxiaClient.GetCharState       = function() return charState end
 
 _G.WuxiaClient.RebindCombatAction = function(actionName, ...)
