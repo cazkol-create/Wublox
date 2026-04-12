@@ -1,23 +1,21 @@
 -- @ScriptType: ModuleScript
 -- @ScriptType: ModuleScript
--- ============================================================
---  CombatVFXConfig.lua  |  ModuleScript
---  Location: ReplicatedStorage/Modules/CombatVFXConfig
+-- Location: ReplicatedStorage/Modules/CombatVFXConfig
 --
---  Declarative map from combat events → (category, effectName) pairs.
+-- Declarative map from combat events → (category, effectName) pairs.
 --
---  Both CombatClient and any future systems read from here.
---  Adding a new effect = add a row here + add the Part to
---  ReplicatedStorage/Effects/Combat/.  No code changes needed.
+-- Both CombatClient and any future systems read from here.
+-- Adding a new effect = add a row here + add the Part to
+-- ReplicatedStorage/Effects/Combat/.  No code changes needed.
 --
---  ── Animation marker names ───────────────────────────────────
---  Add KeyframeMarkers in the Roblox Animation Editor with the
---  names listed in AttackMarkers[weaponType][styleName].
---  Common names used here:
---    "Swing"   — the moment the weapon starts moving (early arc)
---    "Hit"     — the exact frame the hitbox should fire (impact)
---    "Recover" — end of the attack recovery phase
--- ============================================================
+-- ── Animation marker names ───────────────────────────────────
+-- Add KeyframeMarkers in the Roblox Animation Editor with the
+-- names listed in AttackMarkers[weaponType][styleName].
+-- Common names used here:
+--   "Swing"   — the moment the weapon starts moving (early arc)
+--   "Impact"  — the exact frame the hitbox becomes active (about to hit)
+--   "Hit"     — the exact frame the hitbox should fire (impact)
+--   "Recover" — end of the attack recovery phase
 
 local CombatVFXConfig = {}
 
@@ -36,30 +34,38 @@ CombatVFXConfig.AttackMarkers = {
 
 	Fist = {
 		Default = {
-			{ marker = "Swing", category = "Combat", effectName = "Fist_Swing",
+			{ marker = "Swing",  category = "Combat", effectName = "Fist_Swing",
 				options = { duration = 0.4, transparent = true } },
-			{ marker = "Hit",   category = "Combat", effectName = "Fist_Hit",
+			{ marker = "Impact", category = "Combat", effectName = "Fist_Impact",
+				options = { duration = 0.3, transparent = true } },
+			{ marker = "Hit",    category = "Combat", effectName = "Fist_Hit",
 				options = { duration = 1.2, transparent = true } },
 		},
 	},
 
 	Sword = {
 		Default = {
-			{ marker = "Swing", category = "Combat", effectName = "Sword_Swing",
+			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing",
 				options = { duration = 0.5, transparent = true } },
-			{ marker = "Hit",   category = "Combat", effectName = "Sword_Hit",
+			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
+				options = { duration = 0.3, transparent = true } },
+			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
 				options = { duration = 1.2, transparent = true } },
 		},
 		Flowing = {
-			{ marker = "Swing", category = "Combat", effectName = "Sword_Swing_Light",
+			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing_Light",
 				options = { duration = 0.4, transparent = true } },
-			{ marker = "Hit",   category = "Combat", effectName = "Sword_Hit",
+			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
+				options = { duration = 0.3, transparent = true } },
+			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
 				options = { duration = 1.0, transparent = true } },
 		},
 		Storm = {
-			{ marker = "Swing", category = "Combat", effectName = "Sword_Swing_Heavy",
+			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing_Heavy",
 				options = { duration = 0.7, transparent = true } },
-			{ marker = "Hit",   category = "Combat", effectName = "Sword_Hit",
+			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
+				options = { duration = 0.4, transparent = true } },
+			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
 				options = { duration = 1.5, transparent = true } },
 		},
 	},
@@ -95,7 +101,6 @@ CombatVFXConfig.FeedbackEffects = {
 	},
 
 	-- Received when your attack connected with a full hit on the enemy.
-	-- The server sends the target's position so the client can place the VFX.
 	HitConnected = {
 		world  = { category = "Combat", effectName = "Generic_Hit",  options = { duration = 1.5, transparent = true } },
 	},
