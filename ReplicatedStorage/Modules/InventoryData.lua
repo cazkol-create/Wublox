@@ -30,9 +30,9 @@ InventoryData.Weapons = {
 		defaultStyle = "Default",
 	},
 	{
-		toolName     = "Sword",
-		weaponType   = "Sword",
-		displayName  = "Sword",
+		toolName     = "Greatsword",
+		weaponType   = "Greatsword",
+		displayName  = "Failure",
 		styles       = { "Default", "Flowing", "Storm" },
 		defaultStyle = "Default",
 	},
