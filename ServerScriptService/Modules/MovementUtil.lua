@@ -1,29 +1,27 @@
 -- @ScriptType: ModuleScript
 -- @ScriptType: ModuleScript
+-- @ScriptType: ModuleScript
 -- ============================================================
 --  MovementUtil.lua  |  ModuleScript
 --  Location: ServerScriptService/Modules/MovementUtil
 --
 --  CHANGES:
---    • NormalDash now accepts a `direction` parameter
---      ("forward" | "back" | "left" | "right").
---      Sent by MovementClient based on held WASD keys.
---
---    • NORMAL_DASH_CD, EVASIVE_DASH_CD, NORMAL_SPEED,
---      NORMAL_DASH_FORCE, NORMAL_DASH_DURATION, EVASIVE_DASH_FORCE
---      are now read from CombatConfig so there is a single source.
---
---    • All velocity (ApplyVelocity, dashes) still uses
---      attachment-relative LinearVelocity (RelativeTo = Attachment0).
+--    • Slide now uses a Heartbeat loop to smoothly decelerate the
+--      LinearVelocity from SLIDE_INITIAL_SPEED down to 0 over
+--      SLIDE_DURATION seconds (ease-out cubic curve), instead of
+--      maintaining a constant velocity for the whole duration.
+--      This makes the slide feel natural — fast launch, gradual stop.
+--    • NormalDash direction parameter support (unchanged).
+--    • All CombatConfig constants still used as the source of truth.
 -- ============================================================
 
 local Players  = game:GetService("Players")
 local Debris   = game:GetService("Debris")
 local RS       = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local CombatConfig = require(script.Parent.CombatConfig)
 
--- Lazy-loaded to avoid circular requires
 local StatusEffectUtil, KnockdownUtil, CombatState
 local function mods()
 	if not CombatState then
@@ -36,13 +34,7 @@ end
 local MovementUtil = {}
 
 -- ============================================================
--- 1.  ApplyVelocity  — attachment-relative
--- ============================================================
--- velocityDef:
---   forward  : studs/s along the character's look direction
---   up       : studs/s upward
---   duration : seconds the LinearVelocity constraint is active
---   timing   : "start" (default) | "hit" — caller decides when to invoke
+-- 1.  ApplyVelocity
 -- ============================================================
 function MovementUtil.ApplyVelocity(root, velocityDef)
 	if not velocityDef then return end
@@ -61,7 +53,6 @@ function MovementUtil.ApplyVelocity(root, velocityDef)
 	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
 	lv.RelativeTo             = Enum.ActuatorRelativeTo.Attachment0
 	lv.MaxForce               = 9e4
-	-- attachment-local space: -Z = forward, +Y = up
 	lv.VectorVelocity         = Vector3.new(0, up, -fwd)
 	lv.Parent                 = root
 
@@ -70,12 +61,8 @@ function MovementUtil.ApplyVelocity(root, velocityDef)
 end
 
 -- ============================================================
--- 2.  NormalDash  — called when action="NormalDash"
---     direction: "forward" | "back" | "left" | "right"
---     Falls back to "forward" if direction is absent or unrecognised.
+-- 2.  NormalDash
 -- ============================================================
--- Velocity vectors in attachment-local space:
---   forward → -Z, back → +Z, left → -X, right → +X
 local DASH_VECTORS = {
 	forward = Vector3.new( 0,  0, -1),
 	back    = Vector3.new( 0,  0,  1),
@@ -88,7 +75,6 @@ function MovementUtil.NormalDash(player, character, direction)
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if not root then return end
 
-	-- Stamp cooldown
 	local state = CombatState.Get(player)
 	state.normalDashCooldownUntil = os.clock() + CombatConfig.NORMAL_DASH_CD
 
@@ -107,7 +93,6 @@ function MovementUtil.NormalDash(player, character, direction)
 	Debris:AddItem(lv,  CombatConfig.NORMAL_DASH_DURATION)
 	Debris:AddItem(att, CombatConfig.NORMAL_DASH_DURATION)
 
-	-- Notify client: play dash animation (direction included for anims)
 	local charFB = RS:FindFirstChild("CharacterFeedback")
 	if charFB then
 		charFB:FireClient(player, { type = "NormalDash", direction = direction or "forward" })
@@ -115,7 +100,7 @@ function MovementUtil.NormalDash(player, character, direction)
 end
 
 -- ============================================================
--- 3.  DashAttack  — sustained forward dash for skill use
+-- 3.  DashAttack
 -- ============================================================
 function MovementUtil.DashAttack(attackerPlayer, dashDef, style, helpers)
 	mods()
@@ -148,7 +133,7 @@ function MovementUtil.DashAttack(attackerPlayer, dashDef, style, helpers)
 	local function fireStrike()
 		if not char.Parent then return end
 		if StatusEffectUtil.BlocksAttack(char) then return end
-		local hits = helpers.castHitbox(char, dashDef, attackerPlayer, function(targetChar, targetHum)
+		helpers.castHitbox(char, dashDef, attackerPlayer, function(targetChar, targetHum)
 			local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
 			if not targetRoot then return end
 			local fwd   = root.CFrame.LookVector
@@ -192,7 +177,7 @@ function MovementUtil.DashAttack(attackerPlayer, dashDef, style, helpers)
 end
 
 -- ============================================================
--- 4.  EvasiveDash  — cancels SoftKnockdown
+-- 4.  EvasiveDash
 -- ============================================================
 function MovementUtil.EvasiveDash(player, character)
 	mods()
@@ -201,7 +186,6 @@ function MovementUtil.EvasiveDash(player, character)
 
 	KnockdownUtil.CancelSoftKnockdown(character)
 
-	-- Backwards roll impulse (world-space — no rotation issue since it's instantaneous)
 	local backDir = -root.CFrame.LookVector + Vector3.new(0, 0.15, 0)
 	root:ApplyImpulse(backDir.Unit * CombatConfig.EVASIVE_DASH_FORCE * root.AssemblyMass)
 
@@ -213,8 +197,20 @@ function MovementUtil.EvasiveDash(player, character)
 end
 
 -- ============================================================
--- New MovementUtil.Slide Function
+-- 5.  Slide  — smooth deceleration via Heartbeat loop
+--
+--  The LinearVelocity starts at SLIDE_INITIAL_SPEED and is
+--  eased out (cubic) to 0 over SLIDE_DURATION seconds.
+--  This gives a punchy launch that naturally bleeds off,
+--  rather than an abrupt stop at a fixed duration.
 -- ============================================================
+local SLIDE_INITIAL_SPEED = 65   -- studs/s at the start of the slide
+
+local function easeOutCubic(t)
+	-- t in [0, 1] → returns value in [1, 0] (starts fast, ends slow)
+	local inv = 1 - t
+	return inv * inv * inv
+end
 
 function MovementUtil.Slide(player, character)
 	mods()
@@ -222,28 +218,59 @@ function MovementUtil.Slide(player, character)
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if not root then return end
 
+	local hum = character:FindFirstChildOfClass("Humanoid")
+
+	-- Lower WalkSpeed during slide so the player can't steer out of it
+	if hum then hum.WalkSpeed = 4 end
+
 	local att = Instance.new("Attachment")
 	att.Parent = root
 
 	local lv = Instance.new("LinearVelocity")
-	lv.Attachment0 = att
+	lv.Attachment0            = att
 	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
-	lv.RelativeTo = Enum.ActuatorRelativeTo.Attachment0
-	lv.MaxForce = 1.2e5
-	lv.VectorVelocity = Vector3.new(0, 0, -50)
-	lv.Parent = root
+	lv.RelativeTo             = Enum.ActuatorRelativeTo.Attachment0
+	lv.MaxForce               = 1.4e5
+	lv.VectorVelocity         = Vector3.new(0, 0, -SLIDE_INITIAL_SPEED)
+	lv.Parent                 = root
 
-	Debris:AddItem(lv, 0.8)
-	Debris:AddItem(att, 0.8)
+	local duration = CombatConfig.SLIDE_DURATION  -- 0.8 s
+	local elapsed  = 0
+	local conn
 
-	--[[ I-frames
-	local tag = Instance.new("BoolValue")
-	tag.Name = "IFrames"
-	tag.Parent = character
-	Debris:AddItem(tag, 0.5)
-	]]
+	conn = RunService.Heartbeat:Connect(function(dt)
+		elapsed += dt
 
-	-- Notify client
+		-- If character is gone or CC'd mid-slide, abort immediately
+		if not root.Parent or not character.Parent then
+			conn:Disconnect()
+			pcall(function() lv:Destroy() end)
+			pcall(function() att:Destroy() end)
+			return
+		end
+
+		if elapsed >= duration then
+			conn:Disconnect()
+			lv:Destroy()
+			att:Destroy()
+			-- Restore WalkSpeed once the slide ends
+			if hum and hum.Parent then
+				hum.WalkSpeed = CombatConfig.NORMAL_SPEED
+			end
+			return
+		end
+
+		-- Ease out: t = 0 → full speed, t = 1 → zero speed
+		local t     = elapsed / duration
+		local speed = SLIDE_INITIAL_SPEED * easeOutCubic(t)
+		lv.VectorVelocity = Vector3.new(0, 0, -speed)
+	end)
+
+	-- Stamp server-side slide cooldown
+	local state = CombatState.Get(player)
+	state.slideCooldownUntil = os.clock() + CombatConfig.SLIDE_COOLDOWN
+
+	-- Notify client to play slide animation
 	local charFB = RS:FindFirstChild("CharacterFeedback")
 	if charFB then
 		charFB:FireClient(player, { type = "Slide" })
