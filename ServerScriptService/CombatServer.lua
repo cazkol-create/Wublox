@@ -1,20 +1,4 @@
 -- @ScriptType: Script
--- @ScriptType: Script
--- ============================================================
---  CombatServer.lua  |  Script (NOT ModuleScript)
---  Location: ServerScriptService
---
---  CHANGES IN THIS VERSION (Patch 2):
---
---  1. COMBAT TAG INTEGRATION
---     • CombatTag.Tag(attackerPlayer) called at the top of handleAttack.
---     • CombatTag.Tag(targetPlayer) called after TakeDamage in the full-hit
---       branch so the defender's regen is also paused.
---
---  2. RUNNING ATTACK
---     • New "RunAttack" action received from CombatClient when player M1s
---       while sprinting.  Uses style.attacks.runAttack def.
---     • Does NOT touch combo counter — completely separate from M1 chain.
 --
 --  3. SLIDE GROUND CHECK
 --     • Server now rejects Slide actions when the character is airborne
@@ -48,7 +32,10 @@ local InventoryData    = require(RS.Modules.InventoryData)
 local function getOrCreate(parent, name, class)
 	local e = parent:FindFirstChild(name)
 	if e then return e end
-	local obj = Instance.new(class); obj.Name = name; obj.Parent = parent; return obj
+	local obj = Instance.new(class)
+	obj.Name = name
+	obj.Parent = parent
+	return obj
 end
 
 local Combat            = RS:WaitForChild("Combat")
@@ -74,6 +61,67 @@ local CONFIG = {
 }
 
 local debugPlayers = {}
+
+-- ============================================================
+-- COOLDOWN SYSTEM
+-- ============================================================
+local cooldownsByPlayer = {}
+local CooldownCreated = getOrCreate(script, "CooldownCreated", "BindableEvent")
+
+local function getCooldownStore(player)
+	local store = cooldownsByPlayer[player]
+	if not store then
+		store = {}
+		cooldownsByPlayer[player] = store
+	end
+	return store
+end
+
+local function startCooldown(player, name, duration, meta)
+	duration = math.max(0, tonumber(duration) or 0)
+
+	local now = os.clock()
+	local store = getCooldownStore(player)
+	local previous = store[name]
+
+	local record = {
+		name = name,
+		startedAt = now,
+		endsAt = now + duration,
+		duration = duration,
+		meta = meta or {},
+	}
+
+	store[name] = record
+	CooldownCreated:Fire(player, record, previous)
+	RS.CooldownFeedback:FireClient(player, name, duration)
+
+	return record
+end
+
+local function getCooldown(player, name)
+	local store = getCooldownStore(player)
+	local record = store[name]
+	if not record then
+		return nil, 0
+	end
+
+	local remaining = record.endsAt - os.clock()
+	if remaining <= 0 then
+		store[name] = nil
+		return nil, 0
+	end
+
+	return record, remaining
+end
+
+local function hasCooldown(player, name)
+	return getCooldown(player, name) ~= nil
+end
+
+local function clearCooldowns(player)
+	cooldownsByPlayer[player] = nil
+end
 
 -- ============================================================
 -- STYLE LOADER
@@ -348,7 +396,7 @@ Combat.OnServerEvent:Connect(function(player, data)
 		local style = getPlayerStyle(player); if not style then return end
 
 		local flourishCD = (style.attacks.Last and style.attacks.Last.serverCD) or CONFIG.RATE_FLOURISH
-		if now - state.lastFlourishTime < flourishCD then return end
+		if hasCooldown(player, "M1") then return end
 
 		local maxCombo = getMaxCombo(style)
 		local comboIdx = CombatState.GetCombo(player)
@@ -360,6 +408,11 @@ Combat.OnServerEvent:Connect(function(player, data)
 			if not def then return end
 			state.lastFlourishTime = now
 			state.lastLightTime    = now
+			startCooldown(player, "M1", flourishCD, {
+				action = "M1",
+				track = trackName,
+				combo = comboIdx,
+			})
 			CombatState.ResetCombo(player)
 			CombatState.SetAttacking(player, (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + 0.05)
 		else
@@ -390,10 +443,16 @@ Combat.OnServerEvent:Connect(function(player, data)
 		local def = style.attacks["Heavy"]; if not def then return end
 
 		local serverCD = def.serverCD or CONFIG.RATE_HEAVY
-		if now - state.lastHeavyTime < serverCD then return end
+		if hasCooldown(player, "Heavy") then return end
 		if CombatState.IsAttacking(player) then return end
 
-		state.lastHeavyTime = now; state.lastLightTime = now
+		startCooldown(player, "Heavy", serverCD, {
+			action = "Heavy",
+			track = "Heavy",
+		})
+
+		state.lastHeavyTime = now
+		state.lastLightTime = now
 		CombatState.SetAttacking(player, (def.windupWait or 0) + 0.05)
 
 		local preLockDur = (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + CombatConfig.COMBO_PRELOCK_BUFFER
@@ -416,7 +475,13 @@ Combat.OnServerEvent:Connect(function(player, data)
 		if not def then return end
 
 		local serverCD = def.serverCD or 0.6
-		if now - (state.lastRunAttackTime or 0) < serverCD then return end
+		if hasCooldown(player, "RunAttack") then return end
+
+		startCooldown(player, "RunAttack", serverCD, {
+			action = "RunAttack",
+			track = "RunAttack",
+		})
+
 		state.lastRunAttackTime = now
 
 		local preLockDur = (def.windupWait or 0) + (def.hitWindow or CONFIG.DEFAULT_HIT_WINDOW) + CombatConfig.COMBO_PRELOCK_BUFFER
@@ -475,10 +540,15 @@ Combat.OnServerEvent:Connect(function(player, data)
 		if StatusEffectUtil.BlocksAttack(character) then return end
 		if RagdollUtil.IsRagdolled(character) then return end
 		if not CombatState.CanSlide(player) then return end
+		if hasCooldown(player, "Slide") then return end
 		-- Reject slides while airborne
 		if hum and hum.FloorMaterial == Enum.Material.Air then return end
 
-		state.slideCooldownUntil = now + CombatConfig.SLIDE_COOLDOWN
+		local cd = startCooldown(player, "Slide", CombatConfig.SLIDE_COOLDOWN, {
+			action = "Slide",
+		})
+		state.slideCooldownUntil = cd.endsAt
+
 		if MovementUtil.Slide then
 			task.spawn(MovementUtil.Slide, player, character)
 		else
@@ -561,5 +631,6 @@ end
 
 Players.PlayerRemoving:Connect(function(player)
 	debugPlayers[player.UserId] = nil
+	clearCooldowns(player)
 	if player.Character then StatusEffectUtil.ClearAll(player.Character) end
 end)
