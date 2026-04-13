@@ -23,6 +23,7 @@ local GameSettingsRE = RS:WaitForChild("GameSettings", 10)
 local Settings = {
 	DebugMode            = false,
 	DisableNotifications = false,
+	ShowCooldowns        = true -- added
 }
 
 local function syncSetting(settingName, value)
@@ -131,6 +132,20 @@ makeToggle(panel,"Debug Mode","Shows hitbox visualizer",72,
 makeToggle(panel,"Disable Notifications","Hides meditation / system toasts",128,
 	function() return Settings.DisableNotifications end,
 	function(v) Settings.DisableNotifications=v end)
+
+makeToggle(panel,"Show Cooldowns","Shows attack cooldown UI",184,
+	function() return Settings.ShowCooldowns end,
+	function(v)
+		Settings.ShowCooldowns = v
+
+		-- update UI instantly
+		local cooldowns = playerGui:FindFirstChild("MainGui")
+			and playerGui.MainGui:FindFirstChild("cooldowns")
+
+		if cooldowns then
+			cooldowns.Visible = v
+		end
+	end)
 
 -- ============================================================
 -- SECTION 2: KEY REBINDS
