@@ -40,7 +40,7 @@ SkillRegistry.Skills = {
 		universal      = false,
 		weaponTypes    = { "Sword" },
 		cooldown       = 8,
-		defaultKeybind = Enum.KeyCode.E,
+		--defaultKeybind = Enum.KeyCode.E,
 		animName       = "Skill_DashSlash",
 	},
 
@@ -51,8 +51,8 @@ SkillRegistry.Skills = {
 		icon           = "",
 		universal      = false,
 		weaponTypes    = { "Fist" },
-		cooldown       = 10,
-		defaultKeybind = Enum.KeyCode.E,
+		cooldown       = 3,
+		--defaultKeybind = Enum.KeyCode.E,
 		animName       = "Skill_TigerClaw",
 	},
 
@@ -65,7 +65,7 @@ SkillRegistry.Skills = {
 		universal      = true,
 		weaponTypes    = nil,   -- nil when universal = true
 		cooldown       = 20,
-		defaultKeybind = Enum.KeyCode.Z,
+		--defaultKeybind = Enum.KeyCode.Z,
 		animName       = "Skill_IronBody",
 	},
 }
