@@ -1,32 +1,21 @@
 -- @ScriptType: LocalScript
 -- @ScriptType: LocalScript
+-- @ScriptType: LocalScript
 -- ============================================================
 --  MovementClient.lua  |  LocalScript
 --  Location: StarterCharacterScripts
 --
 --  CHANGES IN THIS VERSION:
 --
---  1. RUN ANIMATION
---     AnimationHandler manages a "Sprint" group.
---     Run animation loaded from RS/Animations/Movement/Run.
---     Plays when sprint starts, stops when sprint ends.
---     CombatClient hooks via _G.WuxiaMovement.OnSprintChanged().
+--  1. SPRINT NOW TRIGGERED BY HOLDING SHIFT
+--     Hold LeftShift to sprint, release to stop.
+--     Double-tap W detection has been removed.
 --
---  2. SLIDE SYSTEM
---     Press C while sprinting (and grounded) to slide.
---     • Client: plays Slide animation optimistically, fires server.
---     • Server: (MovementUtil.Slide) applies forward velocity,
---       handles slope detection, grants brief I-frames.
---     • CONFIG.SLIDE_DURATION / SLIDE_COOLDOWN control timing.
+--  2. SLIDE SYSTEM (unchanged behaviour, server handles decel)
 --
---  3. JUMP COOLDOWN
---     humanoid.Jumping listener disables jumping for JUMP_COOLDOWN
---     seconds after each jump via SetStateEnabled.
---     Mirrors CombatConfig.JUMP_COOLDOWN — keep both in sync.
+--  3. JUMP COOLDOWN (unchanged)
 --
---  4. SPRINT CALLBACK HOOK
---     _G.WuxiaMovement.OnSprintChanged(fn) lets CombatClient
---     subscribe to sprint state changes for run animation sync.
+--  4. SPRINT CALLBACK HOOK (unchanged)
 -- ============================================================
 
 local Players       = game:GetService("Players")
@@ -45,14 +34,12 @@ local AnimationHandler = require(RS.Modules.AnimationHandler)
 local Combat           = RS:WaitForChild("Combat")
 local CharacterFeedback= RS:WaitForChild("CharacterFeedback", 10)
 
--- AnimationHandler instance for movement-specific animations.
--- Uses separate groups from CombatClient so there's no cross-script conflict.
 local moveAnim = AnimationHandler.new(animator)
 
 -- ============================================================
 -- MOVEMENT ANIMATION LOADING
 -- ============================================================
-local movementTracks    = {}  -- [animName] = AnimationTrack
+local movementTracks    = {}
 local animRoot          = RS:WaitForChild("Animations", 10)
 
 task.spawn(function()
@@ -78,12 +65,13 @@ end)
 local CONFIG = {
 	NORMAL_SPEED          = 16,
 	SPRINT_SPEED          = 26,
-	W_DOUBLE_TAP_WINDOW   = 0.30,
 	MOVE_STOP_THRESHOLD   = 0.05,
 
-	DASH_KEYBIND          = Enum.KeyCode.LeftShift,
+	-- Sprint is now hold-Shift; Shift tap also fires NormalDash
+	SPRINT_KEYBIND        = Enum.KeyCode.LeftShift,
+	DASH_KEYBIND          = Enum.KeyCode.Q,
 	DASH_COOLDOWN         = 3.0,
-	AUTO_SPRINT_AFTER_DASH= true,
+	AUTO_SPRINT_AFTER_DASH= false,   -- disabled: Shift already handles sprint
 
 	EVASIVE_DASH_KEYBIND  = Enum.KeyCode.E,
 	EVASIVE_DASH_COOLDOWN = 15.0,
@@ -92,10 +80,9 @@ local CONFIG = {
 	SHIFT_LOCK_OFFSET     = Vector3.new(2, 0, 0),
 
 	SLIDE_KEYBIND         = Enum.KeyCode.C,
-	SLIDE_DURATION        = 0.8,   -- keep in sync with CombatConfig.SLIDE_DURATION
-	SLIDE_COOLDOWN        = 1.5,   -- keep in sync with CombatConfig.SLIDE_COOLDOWN
+	SLIDE_DURATION        = 0.8,
+	SLIDE_COOLDOWN        = 1.5,
 
-	-- Keep in sync with CombatConfig.JUMP_COOLDOWN
 	JUMP_COOLDOWN         = 0.5,
 }
 
@@ -108,10 +95,8 @@ local evasiveAvailable = true
 local slideAvailable   = true
 local isSliding        = false
 local sprintHeartbeat  = nil
-local lastWTapTime     = 0
 local endlagExpiry     = 0
 
--- Sprint change callbacks (registered by CombatClient for run anim)
 local sprintCallbacks  = {}
 
 local function fireSprintChanged(state)
@@ -153,7 +138,6 @@ local function startSprint()
 	isSprinting = true
 	humanoid.WalkSpeed = CONFIG.SPRINT_SPEED
 
-	-- Run animation
 	local runTrack = movementTracks["Run"]
 	if runTrack then
 		moveAnim:Play("Sprint", runTrack, 0.2)
@@ -166,18 +150,20 @@ local function startSprint()
 	end)
 end
 
+-- ── Hold Shift to sprint ──────────────────────────────────────
 UIS.InputBegan:Connect(function(input, processed)
 	if processed then return end
-	if input.KeyCode == Enum.KeyCode.W then
-		local now = time()
-		if now - lastWTapTime <= CONFIG.W_DOUBLE_TAP_WINDOW then startSprint() end
-		lastWTapTime = now
+	if input.KeyCode == CONFIG.SPRINT_KEYBIND then
+		startSprint()
 	end
 end)
 UIS.InputEnded:Connect(function(input)
-	if input.KeyCode == Enum.KeyCode.W then stopSprint() end
+	if input.KeyCode == CONFIG.SPRINT_KEYBIND then
+		stopSprint()
+	end
 end)
 
+-- Stop sprint (and slide) when CC'd
 character.ChildAdded:Connect(function(child)
 	local n = child.Name
 	if n == "Stunned" or n == "SoftKnockdown" or n == "HardKnockdown" or n == "Ragdolled" then
@@ -207,7 +193,7 @@ local function getDashDirection()
 end
 
 -- ============================================================
--- NORMAL DASH
+-- NORMAL DASH  (also on Shift — fires alongside sprint start)
 -- ============================================================
 local function doDash()
 	if isInEndlag()      then return end
@@ -219,12 +205,6 @@ local function doDash()
 
 	local direction = getDashDirection()
 	Combat:FireServer({ action = "NormalDash", direction = direction })
-
-	if CONFIG.AUTO_SPRINT_AFTER_DASH and direction == "forward" then
-		task.delay(0.4, function()
-			if not isCCed() then startSprint() end
-		end)
-	end
 end
 
 CAS:BindAction("Movement_Dash", function(_, state, _)
@@ -252,36 +232,31 @@ end, false, CONFIG.EVASIVE_DASH_KEYBIND)
 
 -- ============================================================
 -- SLIDE SYSTEM
--- Press C while sprinting + grounded → server-authoritative velocity boost.
--- Client plays animation optimistically; server confirms and applies force.
+-- Press C while sprinting + grounded → server applies decelerating velocity.
 -- ============================================================
 local function doSlide()
 	if not isSprinting          then return end
 	if not slideAvailable       then return end
 	if isCCed()                 then return end
 	if isSliding                then return end
-	-- Require grounded state
 	if humanoid.FloorMaterial == Enum.Material.Air then return end
 
 	isSliding      = true
 	slideAvailable = false
 
-	-- Update sprint state without triggering the run anim stop
+	-- Stop sprint without playing stop-anim (slide replaces it visually)
 	if sprintHeartbeat then sprintHeartbeat:Disconnect(); sprintHeartbeat = nil end
 	isSprinting = false
 	fireSprintChanged(false)
 
-	-- Optimistic animation
 	local slideTrack = movementTracks["Slide"]
 	if slideTrack then
 		moveAnim:Stop("Sprint", 0.05)
 		moveAnim:Play("Slide", slideTrack, 0.1)
 	end
 
-	-- Fire to server for velocity + I-frames
 	Combat:FireServer({ action = "Slide" })
 
-	-- Restore after slide duration
 	task.delay(CONFIG.SLIDE_DURATION, function()
 		isSliding = false
 		if slideTrack then moveAnim:Stop("Slide", 0.3) end
@@ -338,9 +313,6 @@ end
 
 -- ============================================================
 -- JUMP COOLDOWN
--- Disables jumping via SetStateEnabled for JUMP_COOLDOWN seconds
--- after each jump fires.  The current jump physics proceed normally.
--- Keep CONFIG.JUMP_COOLDOWN in sync with CombatConfig.JUMP_COOLDOWN.
 -- ============================================================
 humanoid.Jumping:Connect(function(active)
 	if not active then return end
@@ -363,7 +335,6 @@ player.CharacterAdded:Connect(function()
 	isSliding        = false
 	endlagExpiry     = 0
 	if sprintHeartbeat then sprintHeartbeat:Disconnect(); sprintHeartbeat = nil end
-	-- Re-enable jumping in case character died mid-jump-cooldown
 	if humanoid then
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 	end
@@ -381,7 +352,6 @@ _G.WuxiaMovement = {
 	EvasiveAvailable = function() return evasiveAvailable end,
 	IsInEndlag       = isInEndlag,
 
-	-- CombatClient hooks this to sync the Run animation.
 	OnSprintChanged  = function(fn)
 		table.insert(sprintCallbacks, fn)
 	end,
