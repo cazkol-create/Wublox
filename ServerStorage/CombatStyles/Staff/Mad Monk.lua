@@ -96,7 +96,7 @@ return {
 			ragdollDuration	= 2.5,
 			velocity     	= { forward = 7, up = 0, duration = 1.38 },
 			serverCD     	= 2.20,
-			endlag       	= 0.50,
+			endlag       	= 1.5,
 		},
 	},
 }
