@@ -1,26 +1,16 @@
 -- @ScriptType: LocalScript
 -- @ScriptType: LocalScript
+-- @ScriptType: LocalScript
 -- ============================================================
 --  CombatClient.lua  |  LocalScript  (StarterCharacterScripts)
 --
---  CHANGES IN THIS VERSION (Patch 2):
+--  CHANGES IN THIS VERSION:
 --
---  1. RUNNING ATTACK
---     • handleM1 checks _G.WuxiaMovement.IsSprinting() before firing.
---       If sprinting, fires action="RunAttack" instead of "M1".
---     • "RunAttack" track loaded alongside other combat tracks.
---     • CombatFeedback handler responds to "PlayRunAttackAnim".
+--  1. RUNNING ATTACK REMOVED — M1 while sprinting now stops the
+--     sprint immediately and fires a normal M1 to the server.
+--     "RunAttack" action is no longer sent.
 --
---  2. IMPACT MARKER SCREEN FLASH
---     • bindTrackMarkers now additionally connects the "Impact"
---       KeyframeMarker to a brief VFXUtil.PlayScreenEffect("impact").
---     • The Impact world-VFX is already handled via CombatVFXConfig
---       (BindAllMarkers picks it up automatically).
---
---  Previous patch notes (Patch 1) retained below:
---
---  COMBO FIX — animation restart
---  MOVEMENT ANIMATIONS  (RS/Animations/Movement/)
+--  Previous patch notes retained for reference.
 -- ============================================================
 
 local CAS        = game:GetService("ContextActionService")
@@ -57,7 +47,7 @@ local CONFIG = {
 }
 
 -- ============================================================
--- ANIMATION HANDLER  — combat
+-- ANIMATION HANDLER
 -- ============================================================
 local anim   = AnimationHandler.new(animator)
 local tracks = {}
@@ -77,13 +67,12 @@ local function reloadTracks(wt, sn)
 	local folder = loadAnimFolder(wt, sn)
 	if not folder then return end
 
-	-- RunAttack included in the load list
-	for _, name in ipairs({"M1","M2","M3","M4","Heavy","Block","Idle","Drawing","Equip","RunAttack"}) do
+	for _, name in ipairs({"M1","M2","M3","M4","Heavy","Block","Idle","Drawing","Equip"}) do
 		local animObj = folder:FindFirstChild(name)
 		if animObj then
 			local ok, t = pcall(function() return animator:LoadAnimation(animObj) end)
 			if ok then tracks[name] = t end
-		elseif name ~= "Drawing" and name ~= "Equip" and name ~= "M4" and name ~= "RunAttack" then
+		elseif name ~= "Drawing" and name ~= "Equip" and name ~= "M4" then
 			warn("[CombatClient] Missing animation:", name, "in", folder:GetFullName())
 		end
 	end
@@ -110,7 +99,7 @@ end
 watchStyleValues()
 
 -- ============================================================
--- MOVEMENT ANIMATIONS  (RS/Animations/Movement/)
+-- MOVEMENT ANIMATIONS
 -- ============================================================
 local movementAnims = {}
 
@@ -118,7 +107,7 @@ local function loadMovementAnims()
 	if not animRoot then return end
 	local folder = animRoot:FindFirstChild("Movement")
 	if not folder then
-		warn("[CombatClient] RS/Animations/Movement/ not found — movement anims disabled")
+		warn("[CombatClient] RS/Animations/Movement/ not found")
 		return
 	end
 	for _, child in ipairs(folder:GetDescendants()) do
@@ -173,20 +162,17 @@ local function bindTrackMarkers(track, wt, sn)
 		end
 		conns = VFXUtil.BindAllMarkers(track, bindTable)
 	end
-
-	-- Impact screen flash — brief warm pulse at the moment the attack is about to land.
-	-- The world VFX for Impact is already wired above via CombatVFXConfig.
+	
 	local impactConn = track:GetMarkerReachedSignal("Impact"):Connect(function()
 		VFXUtil.PlayScreenEffect("impact", 0.08)
 	end)
-	table.insert(conns, impactConn)
+
 
 	track.Stopped:Once(function()
 		for _, c in ipairs(conns) do c:Disconnect() end
 	end)
 end
 
--- ── Force-restart attack animation ──────────────────────────
 local function playAttackTrack(trackName)
 	local track = tracks[trackName]
 	if not track then
@@ -286,7 +272,7 @@ local A_BLOCK = "Combat_Block"
 
 local activeBinds = {
 	[A_M1]    = { Enum.UserInputType.MouseButton1, Enum.KeyCode.ButtonX },
-	[A_HEAVY] = { Enum.KeyCode.Q, Enum.KeyCode.ButtonR2 },
+	[A_HEAVY] = { Enum.KeyCode.R, Enum.KeyCode.ButtonR2 },
 	[A_BLOCK] = { Enum.KeyCode.F, Enum.KeyCode.ButtonL2 },
 }
 
@@ -298,11 +284,10 @@ local function handleM1(_, state, _)
 	if equipping or not hasWeapon() then return Enum.ContextActionResult.Sink end
 	if isBlocked() or isBlocking    then return Enum.ContextActionResult.Sink end
 
-	-- Running attack: send a different action when sprinting
+	-- If sprinting, stop the sprint immediately then do a normal M1
 	local isSprinting = _G.WuxiaMovement and _G.WuxiaMovement.IsSprinting and _G.WuxiaMovement.IsSprinting()
-	if isSprinting then
-		Combat:FireServer({ action = "RunAttack" })
-		return Enum.ContextActionResult.Sink
+	if isSprinting and _G.WuxiaMovement and _G.WuxiaMovement.StopSprint then
+		_G.WuxiaMovement.StopSprint()
 	end
 
 	Combat:FireServer({ action = "M1" })
@@ -370,7 +355,7 @@ local function playFeedbackVFX(eventType, worldPos)
 end
 
 -- ============================================================
--- COMBATFX HANDLER  (UnreliableRemoteEvent — cosmetic only)
+-- COMBATFX HANDLER
 -- ============================================================
 if CombatFX then
 	CombatFX.OnClientEvent:Connect(function(data)
@@ -396,7 +381,7 @@ if CombatFX then
 end
 
 -- ============================================================
--- COMBATFEEDBACK HANDLER  (reliable RemoteEvent)
+-- COMBATFEEDBACK HANDLER
 -- ============================================================
 CombatFeedback.OnClientEvent:Connect(function(data)
 	if not data then return end
@@ -404,10 +389,6 @@ CombatFeedback.OnClientEvent:Connect(function(data)
 	if data.type == "PlayAttackAnim" then
 		charState = "Attacking"
 		playAttackTrack(data.track)
-
-	elseif data.type == "PlayRunAttackAnim" then
-		charState = "Attacking"
-		playAttackTrack("RunAttack")
 
 	elseif data.type == "ParrySuccess" then
 		if parrySound then parrySound:Play() end
@@ -426,7 +407,7 @@ CombatFeedback.OnClientEvent:Connect(function(data)
 end)
 
 -- ============================================================
--- CHARACTER FEEDBACK  (knockdown anims, dash/slide confirmations)
+-- CHARACTER FEEDBACK
 -- ============================================================
 if CharacterFeedback then
 	CharacterFeedback.OnClientEvent:Connect(function(data)
@@ -472,7 +453,7 @@ if CharacterFeedback then
 			end
 
 		elseif data.type == "EndlagStart" then
-			-- Handled by MovementClient — nothing visual to do here.
+			-- Handled by MovementClient
 		end
 	end)
 end
