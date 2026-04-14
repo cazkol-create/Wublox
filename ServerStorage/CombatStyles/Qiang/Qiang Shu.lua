@@ -69,7 +69,7 @@ return {
 			hitboxSize        = Vector3.new(2.5, 9.5, 10.5),
 			hitboxFwd         = -6.0,
 			hitWindow         = 0.24,
-			windupWait        = 1.30,
+			windupWait        = 1.47,
 			breaksBlock       = false,
 			selfImpulse       = 18,
 			ragdoll           = true,
