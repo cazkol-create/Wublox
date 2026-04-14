@@ -1,20 +1,26 @@
 -- @ScriptType: LocalScript
--- @ScriptType: LocalScript
--- @ScriptType: LocalScript
 -- ============================================================
 --  CombatClient.lua  |  LocalScript  (StarterCharacterScripts)
 --
 --  CHANGES IN THIS VERSION:
 --
---  1. RUNNING ATTACK REMOVED — M1 while sprinting now stops the
---     sprint immediately and fires a normal M1 to the server.
---     "RunAttack" action is no longer sent.
+--  VFX SYSTEM REWORK
+--    • VFXUtil now drives particle bursts instead of Part clones.
+--    • bindTrackMarkers() connects GetMarkerReachedSignal for each
+--      entry in CombatVFXConfig.AttackMarkers[wt][sn].
+--      Each marker fires VFXUtil.Play(b.vfxPath, b.amounts, hrp)
+--      at the attacker's HumanoidRootPart.
+--    • Feedback VFX (ParrySuccess, HitConnected, etc.) now also
+--      calls VFXUtil.Play using the world entry in FeedbackEffects.
+--    • PlayScreenEffect stub kept for screen-shake/flash calls.
+--    • Old VFXUtil.BindAllMarkers / VFXUtil.Play(category, name…)
+--      calls removed; all VFX goes through the new API.
 --
---  Previous patch notes retained for reference.
+--  RUNNING ATTACK REMOVED (previous patch)
+--    • M1 while sprinting stops the sprint and fires a normal M1.
 -- ============================================================
 
 local CAS        = game:GetService("ContextActionService")
-local Debris     = game:GetService("Debris")
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -45,6 +51,15 @@ local sharedAnimFolder = animRoot and animRoot:FindFirstChild("Shared")
 local CONFIG = {
 	SHOW_DEBUG_HITBOXES = true,
 }
+
+-- ============================================================
+-- SCREEN EFFECT STUB
+-- Replace with your actual screen-flash / vignette logic.
+-- ============================================================
+local function PlayScreenEffect(effectName, intensity)
+	-- e.g. call your CameraShake or ScreenVignette module here
+	-- PlayScreenEffect("damage", 0.4)
+end
 
 -- ============================================================
 -- ANIMATION HANDLER
@@ -140,39 +155,64 @@ local function isKnockedDown()     return isSoftKnockedDown() or isHardKnockedDo
 local function isBlocked()         return isStunned() or isKnockedDown() or charState == "Ragdolled" end
 
 -- ============================================================
--- VFX MARKER BINDING
+-- VFX HELPERS
 -- ============================================================
-local function getHRP() return character:FindFirstChild("HumanoidRootPart") end
+local function getHRP()
+	return character:FindFirstChild("HumanoidRootPart")
+end
 
 local function getCurrentWeaponStyle()
 	local wt = player:FindFirstChild("Plr_WeaponType")
 	local sn = player:FindFirstChild("Plr_StyleName")
-	return (wt and wt.Value ~= "") and wt.Value,
-	(sn and sn.Value ~= "") and sn.Value
+	return (wt and wt.Value ~= "") and wt.Value or "Fist",
+	       (sn and sn.Value ~= "") and sn.Value or "Default"
 end
 
+-- ============================================================
+-- VFX MARKER BINDING
+-- ============================================================
+-- Connects GetMarkerReachedSignal for every entry in
+-- CombatVFXConfig.AttackMarkers[wt][sn].
+-- When a marker fires, VFXUtil.Play() bursts particles at the
+-- attacker's HumanoidRootPart.
+-- All connections are cleaned up in track.Stopped.
 local function bindTrackMarkers(track, wt, sn)
 	local bindings = CombatVFXConfig.GetMarkers(wt, sn)
-	local conns    = {}
+	if #bindings == 0 then return end
 
-	if #bindings > 0 then
-		local bindTable = {}
-		for _, b in ipairs(bindings) do
-			table.insert(bindTable, { b.marker, b.category, b.effectName, getHRP, b.options })
-		end
-		conns = VFXUtil.BindAllMarkers(track, bindTable)
+	local conns = {}
+
+	for _, b in ipairs(bindings) do
+		-- Capture loop variables
+		local capturedPath    = b.vfxPath
+		local capturedAmounts = b.amounts
+
+		local conn = track:GetMarkerReachedSignal(b.marker):Connect(function()
+			local hrp = getHRP()
+			if hrp then
+				VFXUtil.Play(capturedPath, capturedAmounts, hrp)
+			end
+		end)
+		table.insert(conns, conn)
 	end
-	
+
+	-- Impact screen flash (kept from original)
 	local impactConn = track:GetMarkerReachedSignal("Impact"):Connect(function()
-		VFXUtil.PlayScreenEffect("impact", 0.08)
+		PlayScreenEffect("impact", 0.08)
 	end)
+	table.insert(conns, impactConn)
 
-
+	-- Disconnect all when the track finishes
 	track.Stopped:Once(function()
-		for _, c in ipairs(conns) do c:Disconnect() end
+		for _, c in ipairs(conns) do
+			c:Disconnect()
+		end
 	end)
 end
 
+-- ============================================================
+-- PLAY ATTACK TRACK
+-- ============================================================
 local function playAttackTrack(trackName)
 	local track = tracks[trackName]
 	if not track then
@@ -187,6 +227,7 @@ local function playAttackTrack(trackName)
 	end
 
 	anim:Play("Attack", track, 0.05)
+
 	local wt, sn = getCurrentWeaponStyle()
 	bindTrackMarkers(track, wt, sn)
 
@@ -199,6 +240,31 @@ local function playAttackTrack(trackName)
 	end)
 
 	return track
+end
+
+-- ============================================================
+-- FEEDBACK VFX HELPER
+-- Plays world + screen VFX for server-confirmed combat events.
+-- ============================================================
+local function playFeedbackVFX(eventType, worldPos)
+	local cfg = CombatVFXConfig.GetFeedback(eventType)
+	if not cfg then return end
+
+	if cfg.world then
+		-- Prefer the exact position from the server; fall back to local HRP
+		local cf
+		if worldPos then
+			cf = CFrame.new(worldPos)
+		else
+			local hrp = getHRP()
+			cf = hrp and hrp.CFrame or CFrame.new(0, 0, 0)
+		end
+		VFXUtil.Play(cfg.world.vfxPath, cfg.world.amounts, cf)
+	end
+
+	if cfg.screen then
+		PlayScreenEffect(cfg.screen)
+	end
 end
 
 -- ============================================================
@@ -284,7 +350,7 @@ local function handleM1(_, state, _)
 	if equipping or not hasWeapon() then return Enum.ContextActionResult.Sink end
 	if isBlocked() or isBlocking    then return Enum.ContextActionResult.Sink end
 
-	-- If sprinting, stop the sprint immediately then do a normal M1
+	-- Stop sprint then fire a normal M1
 	local isSprinting = _G.WuxiaMovement and _G.WuxiaMovement.IsSprinting and _G.WuxiaMovement.IsSprinting()
 	if isSprinting and _G.WuxiaMovement and _G.WuxiaMovement.StopSprint then
 		_G.WuxiaMovement.StopSprint()
@@ -342,20 +408,7 @@ local function playSharedAnim(animName)
 end
 
 -- ============================================================
--- VFX FEEDBACK HELPER
--- ============================================================
-local function playFeedbackVFX(eventType, worldPos)
-	local cfg = CombatVFXConfig.GetFeedback(eventType)
-	if not cfg then return end
-	if cfg.world then
-		local target = worldPos and CFrame.new(worldPos) or getHRP()
-		VFXUtil.Play(cfg.world.category, cfg.world.effectName, target, cfg.world.options)
-	end
-	if cfg.screen then VFXUtil.PlayScreenEffect(cfg.screen) end
-end
-
--- ============================================================
--- COMBATFX HANDLER
+-- COMBATFX HANDLER  (unreliable, position-specific events)
 -- ============================================================
 if CombatFX then
 	CombatFX.OnClientEvent:Connect(function(data)
@@ -381,7 +434,7 @@ if CombatFX then
 end
 
 -- ============================================================
--- COMBATFEEDBACK HANDLER
+-- COMBATFEEDBACK HANDLER  (reliable, animation / state events)
 -- ============================================================
 CombatFeedback.OnClientEvent:Connect(function(data)
 	if not data then return end
@@ -402,7 +455,7 @@ CombatFeedback.OnClientEvent:Connect(function(data)
 		playFeedbackVFX("GuardBroken", data.pos)
 
 	elseif data.type == "ParryWhiff" then
-		VFXUtil.PlayScreenEffect("damage", 0.2)
+		PlayScreenEffect("damage", 0.2)
 	end
 end)
 
