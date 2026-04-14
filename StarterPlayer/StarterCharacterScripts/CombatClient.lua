@@ -1,4 +1,5 @@
 -- @ScriptType: LocalScript
+-- @ScriptType: LocalScript
 -- ============================================================
 --  CombatClient.lua  |  LocalScript  (StarterCharacterScripts)
 --
@@ -84,9 +85,27 @@ local function reloadTracks(wt, sn)
 
 	for _, name in ipairs({"M1","M2","M3","M4","Heavy","Block","Idle","Drawing","Equip"}) do
 		local animObj = folder:FindFirstChild(name)
+
+		-- [[ FIX: Correct Idle Fallback and Default State Override ]]
+		if name == "Idle" then
+			-- If no specific idle exists, or we are in the default Fist state, use Movement/Idle
+			if not animObj or (wt == "Fist" and sn == "Default") then
+				local movFolder = animRoot and animRoot:FindFirstChild("Movement")
+				if movFolder and movFolder:FindFirstChild("Idle") then
+					animObj = movFolder:FindFirstChild("Idle")
+				end
+			end
+		end
+
 		if animObj then
 			local ok, t = pcall(function() return animator:LoadAnimation(animObj) end)
-			if ok then tracks[name] = t end
+			if ok then 
+				-- [[ FIX: Prevent Idle overriding other animations & fix joint warnings ]]
+				if name == "Idle" then
+					t.Priority = Enum.AnimationPriority.Idle
+				end
+				tracks[name] = t 
+			end
 		elseif name ~= "Drawing" and name ~= "Equip" and name ~= "M4" then
 			warn("[CombatClient] Missing animation:", name, "in", folder:GetFullName())
 		end
@@ -165,7 +184,7 @@ local function getCurrentWeaponStyle()
 	local wt = player:FindFirstChild("Plr_WeaponType")
 	local sn = player:FindFirstChild("Plr_StyleName")
 	return (wt and wt.Value ~= "") and wt.Value or "Fist",
-	       (sn and sn.Value ~= "") and sn.Value or "Default"
+	(sn and sn.Value ~= "") and sn.Value or "Default"
 end
 
 -- ============================================================
