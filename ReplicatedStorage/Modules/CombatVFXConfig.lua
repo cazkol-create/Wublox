@@ -1,111 +1,207 @@
 -- @ScriptType: ModuleScript
 -- @ScriptType: ModuleScript
--- Location: ReplicatedStorage/Modules/CombatVFXConfig
+-- ============================================================
+--  CombatVFXConfig.lua  |  ModuleScript
+--  Location: ReplicatedStorage/Modules/CombatVFXConfig
 --
--- Declarative map from combat events → (category, effectName) pairs.
+--  Declarative map from animation markers → VFX bursts.
+--  Read by CombatClient to fire VFXUtil.Play() when a
+--  KeyframeMarker fires during an attack animation.
 --
--- Both CombatClient and any future systems read from here.
--- Adding a new effect = add a row here + add the Part to
--- ReplicatedStorage/Effects/Combat/.  No code changes needed.
+--  ── Marker entry fields ──────────────────────────────────────
+--  marker  : string — name of the KeyframeMarker in the animation
+--  vfxPath : string — path under ReplicatedStorage/VisualEffects/
+--                     e.g. "Combat/Sword_Swing"
+--  amounts : table  — { ["1"] = emitCount, ["2"] = emitCount, … }
+--                     keys match the numbered children inside the
+--                     VFX folder (see VFXUtil for folder layout)
 --
--- ── Animation marker names ───────────────────────────────────
--- Add KeyframeMarkers in the Roblox Animation Editor with the
--- names listed in AttackMarkers[weaponType][styleName].
--- Common names used here:
---   "Swing"   — the moment the weapon starts moving (early arc)
---   "Impact"  — the exact frame the hitbox becomes active (about to hit)
---   "Hit"     — the exact frame the hitbox should fire (impact)
---   "Recover" — end of the attack recovery phase
+--  ── Feedback event entries ───────────────────────────────────
+--  Used in CombatClient's CombatFX / CombatFeedback handlers.
+--  vfxPath + amounts for world effects; screen for screen-flash.
+--
+--  ── How to add a new weapon/style ───────────────────────────
+--  1. Create the VFX folder in RS/VisualEffects/Combat/YourEffect/
+--     and add numbered Part/Attachment children with ParticleEmitters.
+--  2. Add an entry to AttackMarkers[weaponType][styleName].
+--  3. Add a KeyframeMarker with the same name in the animation.
+-- ============================================================
 
 local CombatVFXConfig = {}
 
 -- ============================================================
 -- ATTACK ANIMATION MARKERS
--- Each entry binds one KeyframeMarker name to one effect.
---
--- { marker, category, effectName, options }
---   marker      : must match the KeyframeMarker name in the animation
---   category    : subfolder of ReplicatedStorage/Effects/
---   effectName  : Part name inside that subfolder
---   options     : VFXUtil.Play options table (duration, weld, etc.)
---   getTargetFn : omit — CombatClient always passes the attacker's HRP
+-- CombatClient connects to each marker signal on the track and
+-- calls VFXUtil.Play(vfxPath, amounts, attackerHRP).
 -- ============================================================
 CombatVFXConfig.AttackMarkers = {
 
 	Fist = {
 		Default = {
-			{ marker = "Swing",  category = "Combat", effectName = "Fist_Swing",
-				options = { duration = 0.4, transparent = true } },
-			{ marker = "Impact", category = "Combat", effectName = "Fist_Impact",
-				options = { duration = 0.3, transparent = true } },
-			{ marker = "Hit",    category = "Combat", effectName = "Fist_Hit",
-				options = { duration = 1.2, transparent = true } },
+			{
+				marker  = "Swing",
+				vfxPath = "Combat/Fist_Swing",
+				amounts = { ["1"] = 8, ["2"] = 5 },
+			},
+			{
+				marker  = "Impact",
+				vfxPath = "Combat/Fist_Impact",
+				amounts = { ["1"] = 12 },
+			},
+			{
+				marker  = "Hit",
+				vfxPath = "Combat/Fist_Hit",
+				amounts = { ["1"] = 15, ["2"] = 8 },
+			},
 		},
 	},
 
 	Sword = {
 		Default = {
-			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing",
-				options = { duration = 0.5, transparent = true } },
-			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
-				options = { duration = 0.3, transparent = true } },
-			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
-				options = { duration = 1.2, transparent = true } },
+			{
+				marker  = "Swing",
+				vfxPath = "Combat/Sword_Swing",
+				amounts = { ["1"] = 10, ["2"] = 6 },
+			},
+			{
+				marker  = "Impact",
+				vfxPath = "Combat/Sword_Impact",
+				amounts = { ["1"] = 14 },
+			},
+			{
+				marker  = "Hit",
+				vfxPath = "Combat/Sword_Hit",
+				amounts = { ["1"] = 18, ["2"] = 10 },
+			},
 		},
 		Flowing = {
-			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing_Light",
-				options = { duration = 0.4, transparent = true } },
-			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
-				options = { duration = 0.3, transparent = true } },
-			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
-				options = { duration = 1.0, transparent = true } },
+			{
+				marker  = "Swing",
+				vfxPath = "Combat/Sword_Swing_Light",
+				amounts = { ["1"] = 7, ["2"] = 4 },
+			},
+			{
+				marker  = "Impact",
+				vfxPath = "Combat/Sword_Impact",
+				amounts = { ["1"] = 10 },
+			},
+			{
+				marker  = "Hit",
+				vfxPath = "Combat/Sword_Hit",
+				amounts = { ["1"] = 14, ["2"] = 8 },
+			},
 		},
 		Storm = {
-			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing_Heavy",
-				options = { duration = 0.7, transparent = true } },
-			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
-				options = { duration = 0.4, transparent = true } },
-			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
-				options = { duration = 1.5, transparent = true } },
+			{
+				marker  = "Swing",
+				vfxPath = "Combat/Sword_Swing_Heavy",
+				amounts = { ["1"] = 14, ["2"] = 8 },
+			},
+			{
+				marker  = "Impact",
+				vfxPath = "Combat/Sword_Impact",
+				amounts = { ["1"] = 18 },
+			},
+			{
+				marker  = "Hit",
+				vfxPath = "Combat/Sword_Hit",
+				amounts = { ["1"] = 22, ["2"] = 12 },
+			},
+		},
+	},
+
+	Greatsword = {
+		Default = {
+			{
+				marker  = "Swing",
+				vfxPath = "Combat/Greatsword_Swing",
+				amounts = { ["1"] = 14, ["2"] = 8 },
+			},
+			{
+				marker  = "Impact",
+				vfxPath = "Combat/Greatsword_Impact",
+				amounts = { ["1"] = 20 },
+			},
+			{
+				marker  = "Hit",
+				vfxPath = "Combat/Greatsword_Hit",
+				amounts = { ["1"] = 24, ["2"] = 14 },
+			},
+		},
+	},
+
+	Staff = {
+		["Mad Monk"] = {
+			{
+				marker  = "Swing",
+				vfxPath = "Combat/Staff_Swing",
+				amounts = { ["1"] = 9, ["2"] = 5 },
+			},
+			{
+				marker  = "Impact",
+				vfxPath = "Combat/Staff_Impact",
+				amounts = { ["1"] = 13 },
+			},
+			{
+				marker  = "Hit",
+				vfxPath = "Combat/Staff_Hit",
+				amounts = { ["1"] = 16, ["2"] = 9 },
+			},
+		},
+	},
+
+	Qiang = {
+		["Qiang Shu"] = {
+			{
+				marker  = "Swing",
+				vfxPath = "Combat/Qiang_Swing",
+				amounts = { ["1"] = 9, ["2"] = 5 },
+			},
+			{
+				marker  = "Impact",
+				vfxPath = "Combat/Qiang_Impact",
+				amounts = { ["1"] = 13 },
+			},
+			{
+				marker  = "Hit",
+				vfxPath = "Combat/Qiang_Hit",
+				amounts = { ["1"] = 16, ["2"] = 9 },
+			},
 		},
 	},
 }
 
 -- ============================================================
 -- FEEDBACK EVENT EFFECTS
--- Played in CombatClient when CombatFeedback arrives from server.
--- "screen" field means PlayScreenEffect is also called.
+-- Played in CombatClient when CombatFX / CombatFeedback fires.
+--
+-- world  : { vfxPath, amounts }  — spawned at the event position
+-- screen : string                — passed to VFXUtil.PlayScreenEffect
 -- ============================================================
 CombatVFXConfig.FeedbackEffects = {
 
-	-- Received when YOU successfully parried an attack.
 	ParrySuccess = {
-		world  = { category = "Combat", effectName = "Parry_Flash",  options = { duration = 1.0, transparent = true } },
+		world  = { vfxPath = "Combat/Parry_Flash",  amounts = { ["1"] = 20, ["2"] = 10 } },
 		screen = "parry",
 	},
 
-	-- Received when your attack was parried by the opponent.
 	ParriedByOpponent = {
 		screen = "damage",
 	},
 
-	-- Received when a hit landed on a blocking target.
 	BlockHit = {
-		world  = { category = "Combat", effectName = "Block_Spark",  options = { duration = 0.8, transparent = true } },
+		world  = { vfxPath = "Combat/Block_Spark",  amounts = { ["1"] = 14 } },
 	},
 
-	-- Received when your block was broken.
 	GuardBroken = {
-		world  = { category = "Combat", effectName = "Guard_Break",  options = { duration = 1.2, transparent = true } },
+		world  = { vfxPath = "Combat/Guard_Break",  amounts = { ["1"] = 18, ["2"] = 10 } },
 		screen = "guardbreak",
 	},
 
-	-- Received when your attack connected with a full hit on the enemy.
 	HitConnected = {
-		world  = { category = "Combat", effectName = "Generic_Hit",  options = { duration = 1.5, transparent = true } },
+		world  = { vfxPath = "Combat/Generic_Hit",  amounts = { ["1"] = 16, ["2"] = 8 } },
 	},
 
-	-- Received when YOU were hit (played on the target's client).
 	YouWereHit = {
 		screen = "damage",
 	},
