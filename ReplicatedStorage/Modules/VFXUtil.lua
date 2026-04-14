@@ -1,131 +1,226 @@
 -- @ScriptType: ModuleScript
 -- @ScriptType: ModuleScript
--- Location: ReplicatedStorage/Modules/CombatVFXConfig
+-- ============================================================
+--  VFXUtil.lua  |  ModuleScript
+--  Location: ReplicatedStorage/Modules/VFXUtil
 --
--- Declarative map from combat events → (category, effectName) pairs.
+--  Particle-based VFX system.
 --
--- Both CombatClient and any future systems read from here.
--- Adding a new effect = add a row here + add the Part to
--- ReplicatedStorage/Effects/Combat/.  No code changes needed.
+--  ── Folder layout in ReplicatedStorage ──────────────────────
+--  ReplicatedStorage
+--  └─ VisualEffects
+--     └─ Combat
+--        └─ Sword_Swing          ← vfxPath = "Combat/Sword_Swing"
+--           ├─ 1                 ← Part/Attachment containing ParticleEmitters
+--           └─ 2                 ← another particle setup
 --
--- ── Animation marker names ───────────────────────────────────
--- Add KeyframeMarkers in the Roblox Animation Editor with the
--- names listed in AttackMarkers[weaponType][styleName].
--- Common names used here:
---   "Swing"   — the moment the weapon starts moving (early arc)
---   "Impact"  — the exact frame the hitbox becomes active (about to hit)
---   "Hit"     — the exact frame the hitbox should fire (impact)
---   "Recover" — end of the attack recovery phase
-
-local CombatVFXConfig = {}
-
--- ============================================================
--- ATTACK ANIMATION MARKERS
--- Each entry binds one KeyframeMarker name to one effect.
+--  Each numbered child is a Part or Attachment that holds one
+--  or more ParticleEmitter objects.  The name is the index key
+--  used in the `amounts` table when calling Play().
 --
--- { marker, category, effectName, options }
---   marker      : must match the KeyframeMarker name in the animation
---   category    : subfolder of ReplicatedStorage/Effects/
---   effectName  : Part name inside that subfolder
---   options     : VFXUtil.Play options table (duration, weld, etc.)
---   getTargetFn : omit — CombatClient always passes the attacker's HRP
--- ============================================================
-CombatVFXConfig.AttackMarkers = {
-
-	Fist = {
-		Default = {
-			{ marker = "Swing",  category = "Combat", effectName = "Fist_Swing",
-				options = { duration = 0.4, transparent = true } },
-			{ marker = "Impact", category = "Combat", effectName = "Fist_Impact",
-				options = { duration = 0.3, transparent = true } },
-			{ marker = "Hit",    category = "Combat", effectName = "Fist_Hit",
-				options = { duration = 1.2, transparent = true } },
-		},
-	},
-
-	Sword = {
-		Default = {
-			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing",
-				options = { duration = 0.5, transparent = true } },
-			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
-				options = { duration = 0.3, transparent = true } },
-			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
-				options = { duration = 1.2, transparent = true } },
-		},
-		Flowing = {
-			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing_Light",
-				options = { duration = 0.4, transparent = true } },
-			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
-				options = { duration = 0.3, transparent = true } },
-			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
-				options = { duration = 1.0, transparent = true } },
-		},
-		Storm = {
-			{ marker = "Swing",  category = "Combat", effectName = "Sword_Swing_Heavy",
-				options = { duration = 0.7, transparent = true } },
-			{ marker = "Impact", category = "Combat", effectName = "Sword_Impact",
-				options = { duration = 0.4, transparent = true } },
-			{ marker = "Hit",    category = "Combat", effectName = "Sword_Hit",
-				options = { duration = 1.5, transparent = true } },
-		},
-	},
-}
-
--- ============================================================
--- FEEDBACK EVENT EFFECTS
--- Played in CombatClient when CombatFeedback arrives from server.
--- "screen" field means PlayScreenEffect is also called.
--- ============================================================
-CombatVFXConfig.FeedbackEffects = {
-
-	-- Received when YOU successfully parried an attack.
-	ParrySuccess = {
-		world  = { category = "Combat", effectName = "Parry_Flash",  options = { duration = 1.0, transparent = true } },
-		screen = "parry",
-	},
-
-	-- Received when your attack was parried by the opponent.
-	ParriedByOpponent = {
-		screen = "damage",
-	},
-
-	-- Received when a hit landed on a blocking target.
-	BlockHit = {
-		world  = { category = "Combat", effectName = "Block_Spark",  options = { duration = 0.8, transparent = true } },
-	},
-
-	-- Received when your block was broken.
-	GuardBroken = {
-		world  = { category = "Combat", effectName = "Guard_Break",  options = { duration = 1.2, transparent = true } },
-		screen = "guardbreak",
-	},
-
-	-- Received when your attack connected with a full hit on the enemy.
-	HitConnected = {
-		world  = { category = "Combat", effectName = "Generic_Hit",  options = { duration = 1.5, transparent = true } },
-	},
-
-	-- Received when YOU were hit (played on the target's client).
-	YouWereHit = {
-		screen = "damage",
-	},
-}
-
--- ============================================================
--- HELPERS
+--  ── API ─────────────────────────────────────────────────────
+--
+--  VFXUtil.Play(vfxPath, amounts, cframe)
+--    One-shot burst.  Clones each indexed child from the VFX
+--    folder, positions it at `cframe`, emits the given particle
+--    counts, then cleans up automatically after the longest
+--    particle lifetime expires.
+--
+--    vfxPath : string — path under VisualEffects, e.g. "Combat/Sword_Swing"
+--              OR an Instance reference to the folder directly.
+--    amounts : table  — maps child index (string or number) → emit count
+--              e.g. { ["1"] = 12, ["2"] = 6 }
+--    cframe  : CFrame | BasePart | nil — where to spawn the effect.
+--              If a BasePart, uses its CFrame at call time.
+--
+--  VFXUtil.PlayPersistent(vfxPath, attachTo)
+--    Continuously-emitting effect welded to a BasePart (auras,
+--    persistent buffs, etc.).  All emitters start enabled.
+--    Returns a STOP function — call it when you want the effect
+--    to end.  Emitters are disabled first so existing particles
+--    fade out naturally, then the clones are destroyed.
+--
+--    vfxPath  : string | Instance
+--    attachTo : BasePart — the part to parent the clones into
+--    returns  : () → ()   stop function
 -- ============================================================
 
--- Returns the marker binding list for a weapon/style combo.
--- Falls back to the weapon's Default if the specific style has no entry.
-function CombatVFXConfig.GetMarkers(weaponType, styleName)
-	local wt = CombatVFXConfig.AttackMarkers[weaponType]
-	if not wt then return {} end
-	return wt[styleName] or wt["Default"] or {}
+local RS = game:GetService("ReplicatedStorage")
+
+local VFXUtil = {}
+
+-- ── Root folder ───────────────────────────────────────────────
+local visualEffectsRoot = RS:WaitForChild("VisualEffects", 10)
+
+-- ── Max seconds to wait for lingering particles before force-destroy ─
+local CLEANUP_BUFFER = 0.5
+
+-- ============================================================
+-- INTERNAL: resolve a string path or Instance into a folder
+-- ============================================================
+local function resolvePath(vfxPath)
+	if typeof(vfxPath) == "Instance" then
+		return vfxPath
+	end
+	if typeof(vfxPath) == "string" and visualEffectsRoot then
+		local current = visualEffectsRoot
+		for segment in vfxPath:gmatch("[^/]+") do
+			if not current then return nil end
+			current = current:FindFirstChild(segment)
+		end
+		return current
+	end
+	return nil
 end
 
--- Returns the feedback VFX config for a given event type.
-function CombatVFXConfig.GetFeedback(eventType)
-	return CombatVFXConfig.FeedbackEffects[eventType]
+-- ── Resolve a CFrame from various input types ─────────────────
+local function resolveCFrame(cframe)
+	if typeof(cframe) == "CFrame" then
+		return cframe
+	elseif typeof(cframe) == "Instance" and cframe:IsA("BasePart") then
+		return cframe.CFrame
+	end
+	return CFrame.new(0, 0, 0)
 end
 
-return CombatVFXConfig
+-- ── Walk all ParticleEmitters inside a cloned object ──────────
+local function iterEmitters(obj, fn)
+	if obj:IsA("ParticleEmitter") then
+		fn(obj)
+	end
+	for _, desc in ipairs(obj:GetDescendants()) do
+		if desc:IsA("ParticleEmitter") then
+			fn(desc)
+		end
+	end
+end
+
+-- ── Get the longest particle lifetime in an object ───────────
+local function maxLifetime(obj)
+	local max = 1
+	iterEmitters(obj, function(pe)
+		local lt = pe.Lifetime
+		local hi = typeof(lt) == "NumberRange" and lt.Max or 1
+		if hi > max then max = hi end
+	end)
+	return max
+end
+
+-- ============================================================
+-- PUBLIC: Play  (one-shot burst)
+-- ============================================================
+function VFXUtil.Play(vfxPath, amounts, cframe)
+	local folder = resolvePath(vfxPath)
+	if not folder then
+		warn("[VFXUtil] VFX path not found:", tostring(vfxPath))
+		return
+	end
+
+	-- Host part: invisible anchor in the world
+	local host        = Instance.new("Part")
+	host.Name         = "VFX_Host"
+	host.Anchored     = true
+	host.CanCollide   = false
+	host.CanTouch     = false
+	host.CanQuery     = false
+	host.CastShadow   = false
+	host.Transparency = 1
+	host.Size         = Vector3.new(0.05, 0.05, 0.05)
+	host.CFrame       = resolveCFrame(cframe)
+	host.Parent       = workspace
+
+	local longestLife = 1
+
+	-- Clone each indexed child specified in `amounts`
+	for indexKey, emitCount in pairs(amounts) do
+		local source = folder:FindFirstChild(tostring(indexKey))
+		if not source then
+			warn("[VFXUtil] Index", tostring(indexKey), "not found in", folder:GetFullName())
+			continue
+		end
+
+		local clone  = source:Clone()
+		clone.Parent = host
+
+		-- Track max lifetime for cleanup
+		local life = maxLifetime(clone)
+		if life > longestLife then longestLife = life end
+
+		-- Disable auto-emission then burst
+		iterEmitters(clone, function(pe)
+			pe.Enabled = false
+			pe:Emit(emitCount)
+		end)
+	end
+
+	-- Destroy host after particles have had time to die
+	task.delay(longestLife + CLEANUP_BUFFER, function()
+		if host and host.Parent then
+			host:Destroy()
+		end
+	end)
+end
+
+-- ============================================================
+-- PUBLIC: PlayPersistent  (continuous aura / buff)
+-- ============================================================
+-- Returns a stop() function.  Calling it disables all emitters
+-- so existing particles finish their lifetime, then destroys
+-- the clones after the longest lifetime has passed.
+function VFXUtil.PlayPersistent(vfxPath, attachTo)
+	local noOp = function() end
+
+	local folder = resolvePath(vfxPath)
+	if not folder then
+		warn("[VFXUtil] VFX path not found:", tostring(vfxPath))
+		return noOp
+	end
+	if not attachTo or not attachTo.Parent then
+		return noOp
+	end
+
+	local clones     = {}
+	local longestLife = 1
+	local stopped    = false
+
+	-- Clone every child of the folder so all indexed variants are active
+	for _, child in ipairs(folder:GetChildren()) do
+		local clone  = child:Clone()
+		clone.Parent = attachTo
+		table.insert(clones, clone)
+
+		local life = maxLifetime(clone)
+		if life > longestLife then longestLife = life end
+
+		-- Enable all emitters
+		iterEmitters(clone, function(pe)
+			pe.Enabled = true
+		end)
+	end
+
+	-- Stop function
+	return function()
+		if stopped then return end
+		stopped = true
+
+		for _, clone in ipairs(clones) do
+			if clone and clone.Parent then
+				-- Disable emitters; let existing particles die naturally
+				iterEmitters(clone, function(pe)
+					pe.Enabled = false
+				end)
+				-- Destroy after fade-out
+				local capturedClone = clone
+				task.delay(longestLife + CLEANUP_BUFFER, function()
+					if capturedClone and capturedClone.Parent then
+						capturedClone:Destroy()
+					end
+				end)
+			end
+		end
+
+		clones = {}
+	end
+end
+
+return VFXUtil
